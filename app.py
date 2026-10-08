@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -109,44 +109,92 @@ def safe_cell_value(sheet, address: str) -> Any:
     return sheet.Range(address).Value
 
 def prepare_excel_for_pdf(workbook):
-    # The publication is the LAMINA 2 worksheet. Keep its original Excel
-    # print area and page setup untouched; those settings are part of the
-    # artwork and can vary between files.
+    # Each received workbook can have slightly different pagination. Preserve
+    # its native PrintArea/PageSetup instead of imposing a fixed row range.
     sheet = workbook.Worksheets("LAMINA 2")
-    state = {"active_sheet": None, "visible": sheet.Visible}
+    state = {
+        "active_sheet": None,
+        "print_area": None,
+        "hidden_shapes": [],
+    }
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
         pass
     try:
-        if sheet.Visible != -1:
-            sheet.Visible = -1
+        state["print_area"] = sheet.PageSetup.PrintArea
+    except Exception:
+        pass
+
+    try:
         sheet.Activate()
     except Exception:
         pass
+
+    # Hide only decorative shapes that begin below the last non-empty cell.
+    # This removes the identity graphic that otherwise leaves a clipped
+    # fragment at the bottom, while preserving content that genuinely varies
+    # in height from file to file.
+    try:
+        used_last_row = 0
+        used = sheet.UsedRange
+        values = used.Value
+        if values is None:
+            used_last_row = used.Row - 1
+        elif isinstance(values, tuple):
+            for r_idx, row in enumerate(values):
+                row_values = row if isinstance(row, tuple) else (row,)
+                if any(v not in (None, "") for v in row_values):
+                    used_last_row = used.Row + r_idx
+        else:
+            if values not in (None, ""):
+                used_last_row = used.Row
+        if used_last_row <= 0:
+            used_last_row = 151
+
+        for shape in sheet.Shapes:
+            try:
+                top_row = shape.TopLeftCell.Row
+                # A shape entirely below the actual cell content is treated as
+                # decorative overflow for this template.
+                if top_row > used_last_row:
+                    shape.Visible = 0
+                    state["hidden_shapes"].append(shape)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     return state
 
 def restore_excel_state(workbook, state):
     try:
         sheet = workbook.Worksheets("LAMINA 2")
-        sheet.Visible = state.get("visible", -1)
+        if state.get("print_area") is not None:
+            sheet.PageSetup.PrintArea = state["print_area"]
+        for shape in state.get("hidden_shapes", []):
+            try:
+                shape.Visible = -1
+            except Exception:
+                pass
         if state.get("active_sheet"):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
 
 def export_pdf(excel, workbook, output: Path):
-    # Export only LAMINA 2 with its native PrintArea/PageSetup. This avoids
-    # the blank technical first page and avoids clipping file-specific content.
+    # Export exactly the workbook's LAMINA 2 using its own print settings.
+    # Retry transient Excel COM failures before reporting an error.
     import tempfile
     import shutil
     last_error = None
-    for attempt in range(1, 3):
+    for attempt in range(1, 4):
         temp_pdf = Path(tempfile.gettempdir()) / f"raiox_{os.getpid()}_{int(time.time()*1000)}_{attempt}.pdf"
         state = prepare_excel_for_pdf(workbook)
         try:
             sheet = workbook.Worksheets("LAMINA 2")
             sheet.Activate()
+            time.sleep(0.25)
             sheet.ExportAsFixedFormat(0, str(temp_pdf))
             if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
                 raise RuntimeError("O Excel não criou o PDF temporário.")
@@ -157,10 +205,12 @@ def export_pdf(excel, workbook, output: Path):
             return
         except Exception as exc:
             last_error = exc
-            if attempt == 1:
-                time.sleep(0.8)
-                continue
-            raise
+            if attempt < 3:
+                time.sleep(1.0)
+                try:
+                    excel.CalculateFull()
+                except Exception:
+                    pass
         finally:
             restore_excel_state(workbook, state)
             try:
@@ -248,23 +298,22 @@ def find_trigger_link_word(page: fitz.Page, trigger_phrases: list[str], click_wo
         wanted = [_word_token(x) for x in re.findall(r"\S+", phrase) if _word_token(x)]
         if not wanted:
             continue
-        for start in range(0, max(0, len(tokens) - len(wanted) + 1)):
-            if tokens[start:start+len(wanted)] == wanted:
-                for j in range(start + len(wanted) - 1, start - 1, -1):
-                    if tokens[j] == click_norm:
-                        w = words[j]
-                        return fitz.Rect(w[0], w[1], w[2], w[3])
-                # Phrase matched exactly, but the configured click word was
-                # not found separately. Fall back to the final word of phrase.
-                w = words[start + len(wanted) - 1]
-                return fitz.Rect(w[0], w[1], w[2], w[3])
+        for start in range(0, len(tokens) - len(wanted) + 1):
+            if tokens[start:start + len(wanted)] != wanted:
+                continue
+            final_index = start + len(wanted) - 1
+            # The configured click word must be the final word of the phrase.
+            if tokens[final_index] != click_norm:
+                continue
+            w = words[final_index]
+            return fitz.Rect(w[0], w[1], w[2], w[3])
     return None
 
 def add_video_hyperlink(pdf_path: Path, link_url: str, trigger_phrases: list[str], click_word: str) -> tuple[bool, str]:
     doc = fitz.open(pdf_path)
     try:
         if not link_url.strip():
-            return False, "vídeo não configurado neste arquivo (URL vazia)"
+            return False, "vídeo detectado, mas URL não configurada"
         for page_index in range(len(doc) - 1, -1, -1):
             page = doc[page_index]
             rect = find_trigger_link_word(page, trigger_phrases, click_word)
@@ -275,7 +324,7 @@ def add_video_hyperlink(pdf_path: Path, link_url: str, trigger_phrases: list[str
                 "from": rect,
                 "uri": link_url.strip(),
             })
-            # Make the clicked word visibly underlined.
+            # Visible underline for the actual clickable word.
             page.draw_line(
                 fitz.Point(rect.x0, rect.y1 + 0.8),
                 fitz.Point(rect.x1, rect.y1 + 0.8),
@@ -469,17 +518,17 @@ class App(tk.Tk):
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.link_var = tk.StringVar()
-        self.marker_var = tk.StringVar()
+        self.trigger_var = tk.StringVar()
         self.click_var = tk.StringVar()
         self.pattern_var = tk.StringVar()
         self.strip_prefix_var = tk.StringVar()
         self.expected_pages_var = tk.StringVar()
 
-        self._field(frm,0,"Pasta dos XLSM",self.input_var,True)
+        self._field(frm,0,"Pasta dos arquivos Excel",self.input_var,True)
         self._field(frm,1,"Pasta dos PDFs",self.output_var,True)
         self._field(frm,2,"URL do vídeo",self.link_var)
-        self._field(frm,3,"Texto que indica vídeo",self.marker_var)
-        self._field(frm,4,"Trecho clicável / variações (;) ",self.click_var)
+        self._field(frm,3,"Frases exatas que ativam o link (;)",self.trigger_var)
+        self._field(frm,4,"Palavra clicável",self.click_var)
         self._field(frm,5,"Regra de nome",self.pattern_var)
         self._field(frm,6,"Prefixo a remover (opcional)",self.strip_prefix_var)
         self._field(frm,7,"Páginas esperadas",self.expected_pages_var)
@@ -522,8 +571,8 @@ class App(tk.Tk):
         self.input_var.set(resolve(self.config_data.get("input_dir","XLSM")))
         self.output_var.set(resolve(self.config_data.get("output_dir","PDF")))
         self.link_var.set(self.config_data.get("link_url",""))
-        self.marker_var.set(self.config_data.get("video_marker","vídeo"))
-        self.click_var.set("; ".join(self.config_data.get("link_texts",[])))
+        self.trigger_var.set("; ".join(self.config_data.get("link_trigger_phrases",[])))
+        self.click_var.set(self.config_data.get("click_text","aqui"))
         self.pattern_var.set(self.config_data.get("output_pattern",DEFAULT_CONFIG["output_pattern"]))
         self.strip_prefix_var.set(self.config_data.get("strip_plan_prefix",""))
         self.expected_pages_var.set(str(self.config_data.get("expected_pages",3)))
@@ -538,8 +587,8 @@ class App(tk.Tk):
                 "input_dir":self.input_var.get(),
                 "output_dir":self.output_var.get(),
                 "link_url":self.link_var.get(),
-                "video_marker":self.marker_var.get(),
-                "link_texts":[x.strip() for x in self.click_var.get().split(";") if x.strip()],
+                "link_trigger_phrases":[x.strip() for x in self.trigger_var.get().split(";") if x.strip()],
+                "click_text":self.click_var.get().strip(),
                 "output_pattern":self.pattern_var.get(),
                 "strip_plan_prefix":self.strip_prefix_var.get(),
                 "expected_pages":int(self.expected_pages_var.get()),
