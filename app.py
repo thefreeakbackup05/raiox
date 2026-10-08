@@ -13,11 +13,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 import fitz
+
+# Explicit pywin32 imports are required so PyInstaller includes the Windows COM/timezone modules.
+if sys.platform.startswith("win"):
+    import pythoncom  # noqa: F401
+    import pywintypes  # noqa: F401
+    import win32timezone  # noqa: F401
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
