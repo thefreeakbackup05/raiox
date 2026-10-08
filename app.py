@@ -24,7 +24,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -163,13 +163,16 @@ def restore_excel_state(workbook, state: dict[str, Any]) -> None:
 def export_workbook_to_pdf(excel, workbook, output_pdf: Path, config: dict[str, Any]) -> None:
     prep = prepare_excel_for_pdf(excel, workbook, config)
     try:
+        # pywin32 may reject VBA named arguments for this COM method; use positional arguments.
         workbook.ExportAsFixedFormat(
-            Type=0,
-            FileName=str(output_pdf),
-            Quality=0,
-            IncludeDocProperties=True,
-            IgnorePrintAreas=False,
-            OpenAfterPublish=False,
+            0,                  # Type = xlTypePDF
+            str(output_pdf),    # Filename
+            0,                  # Quality = xlQualityStandard
+            True,               # IncludeDocProperties
+            False,              # IgnorePrintAreas
+            None,               # From
+            None,               # To
+            False,              # OpenAfterPublish
         )
     finally:
         restore_excel_state(workbook, prep["state"])
