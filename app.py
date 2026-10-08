@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -109,66 +109,65 @@ def excel_date_to_datetime(value: Any) -> Optional[datetime]:
 def safe_cell_value(sheet, address: str) -> Any:
     return sheet.Range(address).Value
 
-def prepare_excel_for_pdf(excel, workbook, config: dict[str, Any]) -> dict[str, Any]:
-    sheet1 = workbook.Worksheets("LAMINA")
-    sheet2 = workbook.Worksheets("LAMINA 2")
-    state = {"visible": {}, "active_sheet": None}
+def prepare_excel_for_pdf(workbook):
+    s1 = workbook.Worksheets("LAMINA")
+    s2 = workbook.Worksheets("LAMINA 2")
+    state = {"visible": {ws.Name: ws.Visible for ws in workbook.Worksheets}, "active_sheet": None}
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
         pass
-    for ws in workbook.Worksheets:
-        state["visible"][ws.Name] = ws.Visible
 
-    # Publicação = somente estas duas lâminas.
-    for ws in workbook.Worksheets:
-        if ws.Name in ("LAMINA", "LAMINA 2"):
+    # Do not rewrite the source workbook's print settings. The received XLSM
+    # already contains the intended print areas/layout. We only select the two
+    # publication sheets so Excel exports them as one PDF.
+    for ws in (s1, s2):
+        if ws.Visible != -1:
             ws.Visible = -1
-        else:
-            ws.Visible = 0
+    try:
+        s1.Select()
+        s2.Select(False)
+    except Exception:
+        pass
+    return state
 
-    sheet1.PageSetup.PrintArea = "$B$2:$T$52"
-    sheet2.PageSetup.PrintArea = "$A$1:$N$169"
-
-    for ws, tall in ((sheet1, 1), (sheet2, 2)):
-        ps = ws.PageSetup
-        ps.Orientation = 2
-        ps.Zoom = False
-        ps.FitToPagesWide = 1
-        ps.FitToPagesTall = tall
-        ps.LeftMargin = excel.Application.CentimetersToPoints(0)
-        ps.RightMargin = excel.Application.CentimetersToPoints(0)
-        ps.TopMargin = excel.Application.CentimetersToPoints(0)
-        ps.BottomMargin = excel.Application.CentimetersToPoints(0)
-        ps.HeaderMargin = 0
-        ps.FooterMargin = 0
-        ps.CenterHorizontally = False
-        ps.CenterVertically = False
-    return {"state": state}
-
-def restore_excel_state(workbook, state: dict[str, Any]) -> None:
-    for name, visibility in state.get("visible", {}).items():
+def restore_excel_state(workbook, state):
+    try:
+        if state.get("active_sheet"):
+            workbook.Worksheets(state["active_sheet"]).Activate()
+    except Exception:
+        pass
+    for name, vis in state.get("visible", {}).items():
         try:
-            workbook.Worksheets(name).Visible = visibility
+            workbook.Worksheets(name).Visible = vis
         except Exception:
             pass
 
-def export_workbook_to_pdf(excel, workbook, output_pdf: Path, config: dict[str, Any]) -> None:
-    prep = prepare_excel_for_pdf(excel, workbook, config)
+def export_pdf(excel, workbook, output: Path):
+    # Export to the user's temp directory first. This separates Excel's PDF
+    # generation from permissions/sync issues in the destination folder.
+    import tempfile
+    temp_pdf = Path(tempfile.gettempdir()) / f"raiox_{os.getpid()}_{int(time.time()*1000)}.pdf"
+    state = prepare_excel_for_pdf(workbook)
     try:
-        # pywin32 may reject VBA named arguments for this COM method; use positional arguments.
-        workbook.ExportAsFixedFormat(
-            0,                  # Type = xlTypePDF
-            str(output_pdf),    # Filename
-            0,                  # Quality = xlQualityStandard
-            True,               # IncludeDocProperties
-            False,              # IgnorePrintAreas
-            None,               # From
-            None,               # To
-            False,              # OpenAfterPublish
-        )
+        # With the two sheets selected, ActiveSheet.ExportAsFixedFormat exports
+        # the selected worksheets together. Only the two required positional
+        # arguments are supplied to avoid COM named-argument quirks.
+        workbook.ActiveSheet.ExportAsFixedFormat(0, str(temp_pdf))
+        if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
+            raise RuntimeError("O Excel não criou o PDF temporário.")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if output.exists():
+            output.unlink()
+        import shutil
+        shutil.copy2(temp_pdf, output)
     finally:
-        restore_excel_state(workbook, prep["state"])
+        restore_excel_state(workbook, state)
+        try:
+            if temp_pdf.exists():
+                temp_pdf.unlink()
+        except Exception:
+            pass
 
 def page_ink_ratio(page: fitz.Page) -> float:
     try:
@@ -327,7 +326,9 @@ def output_name(workbook, input_path: Path, config: dict[str, Any]) -> tuple[str
     return clean_filename(name) + ".pdf", plan, month
 
 def create_excel_instance():
+    import pythoncom
     import win32com.client as win32
+    pythoncom.CoInitialize()
     excel = win32.DispatchEx("Excel.Application")
     excel.Visible = False
     excel.DisplayAlerts = False
@@ -425,6 +426,11 @@ def worker(config: dict[str, Any], callback) -> None:
         if excel is not None:
             try: excel.Quit()
             except Exception: pass
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
     callback("finished", results, f"Processamento concluído: {len(results)} arquivo(s).")
 
 class App(tk.Tk):
