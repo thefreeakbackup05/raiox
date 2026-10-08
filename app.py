@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -35,7 +35,7 @@ DEFAULT_CONFIG = {
     "plan_cell": "A8",
     "month_sheet": "LAMINA 2",
     "month_cell": "A4",
-    "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de [MÊS DO RAIO X]",
+    "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de agosto",
     "strip_plan_prefix": "",
     "expected_pages": 3,
     "trim_trailing_junk": True,
@@ -113,15 +113,48 @@ def prepare_excel_for_pdf(workbook):
     # The finished Raio-X is the LAMINA 2 worksheet. LAMINA is an internal
     # template/technical sheet and must NOT be included in the PDF.
     sheet = workbook.Worksheets("LAMINA 2")
-    state = {"active_sheet": workbook.ActiveSheet.Name if workbook.ActiveSheet else None}
+    state = {
+        "active_sheet": workbook.ActiveSheet.Name if workbook.ActiveSheet else None,
+        "print_area": sheet.PageSetup.PrintArea,
+        "hidden_shapes": [],
+    }
     try:
         sheet.Activate()
+    except Exception:
+        pass
+
+    # The received template's print area extends to row 169 because a
+    # decorative identity graphic is anchored in rows 152:169. The actual
+    # publication content ends at row 151, so exclude that graphic.
+    sheet.PageSetup.PrintArea = "$A$1:$N$151"
+
+    # One chart object in the source template is a separator/decorative
+    # artifact that can be clipped at the page boundary. Hide it only during
+    # export so the source workbook remains untouched.
+    try:
+        for shape in sheet.Shapes:
+            try:
+                nm = str(shape.Name)
+                # Excel-localized names vary; this is the known graphic frame.
+                if nm.casefold() == "gráfico 6".casefold() or nm.casefold() == "chart 6".casefold():
+                    shape.Visible = 0
+                    state["hidden_shapes"].append(shape)
+            except Exception:
+                pass
     except Exception:
         pass
     return state
 
 def restore_excel_state(workbook, state):
     try:
+        sheet = workbook.Worksheets("LAMINA 2")
+        if state.get("print_area") is not None:
+            sheet.PageSetup.PrintArea = state["print_area"]
+        for shape in state.get("hidden_shapes", []):
+            try:
+                shape.Visible = -1
+            except Exception:
+                pass
         if state.get("active_sheet"):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
@@ -243,11 +276,13 @@ def add_video_hyperlink(pdf_path: Path, link_url: str, video_marker: str, link_t
         if not link_url.strip():
             return False, "vídeo encontrado, mas URL do vídeo não configurada"
 
-        rect = find_link_rect(target_page, link_texts)
-        if rect is None:
-            rects = target_page.search_for("aqui", quads=False)
-            if rects:
-                rect = rects[-1]
+        # The clickable text is specifically the final "aqui" of the
+        # video callout. This avoids turning the entire sentence into a link.
+        rects = target_page.search_for("aqui", quads=False)
+        if rects:
+            rect = rects[-1]
+        else:
+            rect = find_link_rect(target_page, link_texts)
         if rect is None:
             return False, "vídeo encontrado, mas trecho clicável não localizado"
 
@@ -256,6 +291,15 @@ def add_video_hyperlink(pdf_path: Path, link_url: str, video_marker: str, link_t
             "from": rect,
             "uri": link_url.strip(),
         })
+
+        # Make the linked word visibly underlined.
+        target_page.draw_line(
+            fitz.Point(rect.x0, rect.y1 + 0.8),
+            fitz.Point(rect.x1, rect.y1 + 0.8),
+            color=(0, 0, 0),
+            width=0.7,
+            overlay=True,
+        )
         temp = str(pdf_path) + ".link"
         doc.save(temp, garbage=4, deflate=True)
         doc.close()
@@ -293,20 +337,17 @@ def infer_month_from_filename(path: Path) -> Optional[str]:
 
 def output_name(workbook, input_path: Path, config: dict[str, Any]) -> tuple[str, str, str]:
     ws_plan = workbook.Worksheets(config.get("plan_sheet", "LAMINA 2"))
-    ws_month = workbook.Worksheets(config.get("month_sheet", "LAMINA 2"))
     plan = str(safe_cell_value(ws_plan, config.get("plan_cell", "A8")) or "").strip()
     strip_prefix = str(config.get("strip_plan_prefix", ""))
     if strip_prefix and plan.casefold().startswith(strip_prefix.casefold()):
         plan = plan[len(strip_prefix):].strip()
-    d = excel_date_to_datetime(safe_cell_value(ws_month, config.get("month_cell", "A4")))
-    month = MONTHS_PT[d.month] if d else infer_month_from_filename(input_path)
-    if not month:
-        raise ValueError(f"Não foi possível determinar o mês do Raio-X em {input_path.name}")
     if not plan:
         raise ValueError(f"Não foi possível determinar o nome do plano em {input_path.name}")
     pattern = str(config.get("output_pattern", DEFAULT_CONFIG["output_pattern"]))
-    name = pattern.replace("[NOME DO PLANO NO EXCEL]", plan).replace("[MÊS DO RAIO X]", month)
-    return clean_filename(name) + ".pdf", plan, month
+    if "[MÊS DO RAIO X]" in pattern:
+        raise ValueError("A regra de nome ainda contém [MÊS DO RAIO X]. Digite o mês diretamente na regra, por exemplo: [NOME DO PLANO NO EXCEL] - Raio X de agosto")
+    name = pattern.replace("[NOME DO PLANO NO EXCEL]", plan)
+    return clean_filename(name) + ".pdf", plan, ""
 
 def create_excel_instance():
     import pythoncom
