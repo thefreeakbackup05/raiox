@@ -1,0 +1,9 @@
+CONFIGURAÇÕES
+- link_url: URL única do vídeo.
+- video_marker: palavra usada para localizar a chamada de vídeo no PDF.
+- link_texts: trechos aceitos para localizar a área clicável.
+- output_pattern: regra de nome do PDF.
+- expected_pages: quantidade esperada de páginas.
+- plan_sheet/plan_cell: origem do nome do plano.
+- month_sheet/month_cell: origem do mês.
+- trim_trailing_junk: remove somente páginas extras no FINAL quando parecem vazias/sobra.
