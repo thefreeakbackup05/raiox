@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -407,7 +407,11 @@ def worker(config: dict[str, Any], callback) -> None:
     input_dir = Path(config["input_dir"]).expanduser()
     output_dir = Path(config["output_dir"]).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    files = sorted([p for p in input_dir.iterdir() if p.is_file() and p.suffix.lower() == ".xlsm"], key=lambda p: p.name.casefold())
+    files = sorted(
+        [p for p in input_dir.iterdir()
+         if p.is_file() and p.suffix.lower() in {".xlsm", ".xlsx"}],
+        key=lambda p: p.name.casefold()
+    )
     if not files:
         callback("finished", [], "Nenhum .xlsm encontrado na pasta de entrada.")
         return
