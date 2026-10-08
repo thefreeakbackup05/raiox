@@ -17,20 +17,19 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
     "output_dir": "PDF",
     "link_url": "",
-    "video_marker": "vídeo",
-    "link_texts": [
-        "nesse vídeo, aqui",
-        "neste vídeo, aqui",
+    "link_trigger_phrases": [
         "nesse vídeo - aqui",
-        "neste vídeo - aqui",
-        "aqui",
+        "neste vídeo, aqui",
+        "nesse vídeo, aqui",
+        "neste vídeo - aqui"
     ],
+    "click_text": "aqui",
     "plan_sheet": "LAMINA 2",
     "plan_cell": "A8",
     "month_sheet": "LAMINA 2",
@@ -110,37 +109,19 @@ def safe_cell_value(sheet, address: str) -> Any:
     return sheet.Range(address).Value
 
 def prepare_excel_for_pdf(workbook):
-    # The finished Raio-X is the LAMINA 2 worksheet. LAMINA is an internal
-    # template/technical sheet and must NOT be included in the PDF.
+    # The publication is the LAMINA 2 worksheet. Keep its original Excel
+    # print area and page setup untouched; those settings are part of the
+    # artwork and can vary between files.
     sheet = workbook.Worksheets("LAMINA 2")
-    state = {
-        "active_sheet": workbook.ActiveSheet.Name if workbook.ActiveSheet else None,
-        "print_area": sheet.PageSetup.PrintArea,
-        "hidden_shapes": [],
-    }
+    state = {"active_sheet": None, "visible": sheet.Visible}
     try:
-        sheet.Activate()
+        state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
         pass
-
-    # The received template's print area extends to row 169 because a
-    # decorative identity graphic is anchored in rows 152:169. The actual
-    # publication content ends at row 151, so exclude that graphic.
-    sheet.PageSetup.PrintArea = "$A$1:$N$151"
-
-    # One chart object in the source template is a separator/decorative
-    # artifact that can be clipped at the page boundary. Hide it only during
-    # export so the source workbook remains untouched.
     try:
-        for shape in sheet.Shapes:
-            try:
-                nm = str(shape.Name)
-                # Excel-localized names vary; this is the known graphic frame.
-                if nm.casefold() == "gráfico 6".casefold() or nm.casefold() == "chart 6".casefold():
-                    shape.Visible = 0
-                    state["hidden_shapes"].append(shape)
-            except Exception:
-                pass
+        if sheet.Visible != -1:
+            sheet.Visible = -1
+        sheet.Activate()
     except Exception:
         pass
     return state
@@ -148,42 +129,46 @@ def prepare_excel_for_pdf(workbook):
 def restore_excel_state(workbook, state):
     try:
         sheet = workbook.Worksheets("LAMINA 2")
-        if state.get("print_area") is not None:
-            sheet.PageSetup.PrintArea = state["print_area"]
-        for shape in state.get("hidden_shapes", []):
-            try:
-                shape.Visible = -1
-            except Exception:
-                pass
+        sheet.Visible = state.get("visible", -1)
         if state.get("active_sheet"):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
 
 def export_pdf(excel, workbook, output: Path):
-    # Export exactly LAMINA 2 using its existing print area/page setup.
-    # This mirrors the manual Excel flow and prevents the blank first page
-    # caused by exporting LAMINA together with LAMINA 2.
+    # Export only LAMINA 2 with its native PrintArea/PageSetup. This avoids
+    # the blank technical first page and avoids clipping file-specific content.
     import tempfile
     import shutil
-    temp_pdf = Path(tempfile.gettempdir()) / f"raiox_{os.getpid()}_{int(time.time()*1000)}.pdf"
-    state = prepare_excel_for_pdf(workbook)
-    try:
-        sheet = workbook.Worksheets("LAMINA 2")
-        sheet.ExportAsFixedFormat(0, str(temp_pdf))
-        if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
-            raise RuntimeError("O Excel não criou o PDF temporário.")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        if output.exists():
-            output.unlink()
-        shutil.copy2(temp_pdf, output)
-    finally:
-        restore_excel_state(workbook, state)
+    last_error = None
+    for attempt in range(1, 3):
+        temp_pdf = Path(tempfile.gettempdir()) / f"raiox_{os.getpid()}_{int(time.time()*1000)}_{attempt}.pdf"
+        state = prepare_excel_for_pdf(workbook)
         try:
-            if temp_pdf.exists():
-                temp_pdf.unlink()
-        except Exception:
-            pass
+            sheet = workbook.Worksheets("LAMINA 2")
+            sheet.Activate()
+            sheet.ExportAsFixedFormat(0, str(temp_pdf))
+            if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
+                raise RuntimeError("O Excel não criou o PDF temporário.")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            if output.exists():
+                output.unlink()
+            shutil.copy2(temp_pdf, output)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == 1:
+                time.sleep(0.8)
+                continue
+            raise
+        finally:
+            restore_excel_state(workbook, state)
+            try:
+                if temp_pdf.exists():
+                    temp_pdf.unlink()
+            except Exception:
+                pass
+    raise last_error or RuntimeError("Falha desconhecida na exportação para PDF.")
 
 def page_ink_ratio(page: fitz.Page) -> float:
     try:
@@ -230,17 +215,19 @@ def trim_extra_pages(pdf_path: Path, expected_pages: int) -> tuple[int, int]:
     doc = fitz.open(pdf_path)
     before = len(doc)
     try:
-        while len(doc) > expected_pages and len(doc) > 1:
-            if not trailing_junk_page(doc[-1]):
+        while len(doc) > expected_pages:
+            # A page beyond the expected publication length that contains no
+            # text is treated as a decorative/identity overflow page.
+            if (doc[-1].get_text("text") or "").strip() == "":
+                doc.delete_page(len(doc) - 1)
+            else:
                 break
-            doc.delete_page(len(doc) - 1)
         after = len(doc)
         if after != before:
             temp = str(pdf_path) + ".trimmed"
             doc.save(temp, garbage=4, deflate=True)
             doc.close()
             os.replace(temp, pdf_path)
-            return before, after
         return before, after
     finally:
         try:
@@ -248,63 +235,60 @@ def trim_extra_pages(pdf_path: Path, expected_pages: int) -> tuple[int, int]:
         except Exception:
             pass
 
-def find_link_rect(page: fitz.Page, candidates: list[str]) -> Optional[fitz.Rect]:
-    for phrase in candidates:
-        phrase = phrase.strip()
-        if not phrase:
+def _word_token(text: str) -> str:
+    return re.sub(r"^[^\wÀ-ÿ]+|[^\wÀ-ÿ]+$", "", normalize_text(text))
+
+def find_trigger_link_word(page: fitz.Page, trigger_phrases: list[str], click_word: str = "aqui") -> Optional[fitz.Rect]:
+    words = page.get_text("words") or []
+    if not words:
+        return None
+    tokens = [_word_token(w[4]) for w in words]
+    click_norm = _word_token(click_word)
+    for phrase in trigger_phrases:
+        wanted = [_word_token(x) for x in re.findall(r"\S+", phrase) if _word_token(x)]
+        if not wanted:
             continue
-        try:
-            rects = page.search_for(phrase, quads=False)
-            if rects:
-                return rects[-1]
-        except Exception:
-            continue
+        for start in range(0, max(0, len(tokens) - len(wanted) + 1)):
+            if tokens[start:start+len(wanted)] == wanted:
+                for j in range(start + len(wanted) - 1, start - 1, -1):
+                    if tokens[j] == click_norm:
+                        w = words[j]
+                        return fitz.Rect(w[0], w[1], w[2], w[3])
+                # Phrase matched exactly, but the configured click word was
+                # not found separately. Fall back to the final word of phrase.
+                w = words[start + len(wanted) - 1]
+                return fitz.Rect(w[0], w[1], w[2], w[3])
     return None
 
-def add_video_hyperlink(pdf_path: Path, link_url: str, video_marker: str, link_texts: list[str]) -> tuple[bool, str]:
+def add_video_hyperlink(pdf_path: Path, link_url: str, trigger_phrases: list[str], click_word: str) -> tuple[bool, str]:
     doc = fitz.open(pdf_path)
     try:
-        marker_norm = normalize_text(video_marker)
-        target_page = None
-        for i in range(len(doc) - 1, -1, -1):
-            txt = normalize_text(doc[i].get_text("text") or "")
-            if marker_norm and marker_norm in txt:
-                target_page = doc[i]
-                break
-        if target_page is None:
-            return False, "nenhuma chamada de vídeo encontrada"
         if not link_url.strip():
-            return False, "vídeo encontrado, mas URL do vídeo não configurada"
-
-        # The clickable text is specifically the final "aqui" of the
-        # video callout. This avoids turning the entire sentence into a link.
-        rects = target_page.search_for("aqui", quads=False)
-        if rects:
-            rect = rects[-1]
-        else:
-            rect = find_link_rect(target_page, link_texts)
-        if rect is None:
-            return False, "vídeo encontrado, mas trecho clicável não localizado"
-
-        target_page.insert_link({
-            "kind": fitz.LINK_URI,
-            "from": rect,
-            "uri": link_url.strip(),
-        })
-
-        # Make the linked word visibly underlined.
-        target_page.draw_line(
-            fitz.Point(rect.x0, rect.y1 + 0.8),
-            fitz.Point(rect.x1, rect.y1 + 0.8),
-            color=(0, 0, 0),
-            width=0.7,
-            overlay=True,
-        )
-        temp = str(pdf_path) + ".link"
-        doc.save(temp, garbage=4, deflate=True)
-        doc.close()
-        os.replace(temp, pdf_path)
-        return True, "hyperlink inserido"
+            return False, "vídeo não configurado neste arquivo (URL vazia)"
+        for page_index in range(len(doc) - 1, -1, -1):
+            page = doc[page_index]
+            rect = find_trigger_link_word(page, trigger_phrases, click_word)
+            if rect is None:
+                continue
+            page.insert_link({
+                "kind": fitz.LINK_URI,
+                "from": rect,
+                "uri": link_url.strip(),
+            })
+            # Make the clicked word visibly underlined.
+            page.draw_line(
+                fitz.Point(rect.x0, rect.y1 + 0.8),
+                fitz.Point(rect.x1, rect.y1 + 0.8),
+                color=(0, 0, 0),
+                width=0.7,
+                overlay=True,
+            )
+            temp = str(pdf_path) + ".link"
+            doc.save(temp, garbage=4, deflate=True)
+            doc.close()
+            os.replace(temp, pdf_path)
+            return True, f"hyperlink inserido na expressão configurada (página {page_index + 1})"
+        return False, "nenhuma expressão exata de vídeo encontrada"
     finally:
         try:
             doc.close()
@@ -402,11 +386,11 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         link_added, detail = add_video_hyperlink(
             output_pdf,
             str(config.get("link_url", "")),
-            str(config.get("video_marker", "vídeo")),
-            [str(x) for x in config.get("link_texts", []) if str(x).strip()]
+            [str(x) for x in config.get("link_trigger_phrases", []) if str(x).strip()],
+            str(config.get("click_text", "aqui"))
         )
         result.link = link_added
-        result.video = "encontrada" in detail or "encontrado" in detail or link_added
+        result.video = link_added or detail == "nenhuma expressão exata de vídeo encontrada"
         if result.pages_after == expected and (not detail.startswith("vídeo encontrado") or link_added):
             result.status = "OK"
         else:
