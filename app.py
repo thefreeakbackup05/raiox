@@ -13,18 +13,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 import fitz
-
-# Explicit pywin32 imports are required so PyInstaller includes the Windows COM/timezone modules.
-if sys.platform.startswith("win"):
-    import pythoncom  # noqa: F401
-    import pywintypes  # noqa: F401
-    import win32timezone  # noqa: F401
-
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -583,6 +576,23 @@ class App(tk.Tk):
         p=str(p)
         if Path(p).exists(): os.startfile(p)
         else: messagebox.showwarning("Pasta",f"Pasta não encontrada:\n{p}")
+
+
+# Log any startup exception to a file even when running as a windowed EXE.
+def _startup_exception_hook(exc_type, exc_value, exc_tb):
+    try:
+        with (app_dir() / "startup_error.log").open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Startup error\\n")
+            traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, f"{exc_value}", "Gerador de Raio-X - erro", 0x10)
+    except Exception:
+        pass
+
+sys.excepthook = _startup_exception_hook
 
 if __name__=="__main__":
     App().mainloop()
