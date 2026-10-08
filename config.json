@@ -2,19 +2,16 @@
   "input_dir": "XLSM",
   "output_dir": "PDF",
   "link_url": "",
-  "video_marker": "vídeo",
-  "link_texts": [
-    "nesse vídeo, aqui",
-    "neste vídeo, aqui",
+  "link_trigger_phrases": [
     "nesse vídeo - aqui",
-    "neste vídeo - aqui",
-    "aqui"
+    "neste vídeo, aqui",
+    "nesse vídeo, aqui",
+    "neste vídeo - aqui"
   ],
+  "click_text": "aqui",
   "plan_sheet": "LAMINA 2",
   "plan_cell": "A8",
-  "month_sheet": "LAMINA 2",
-  "month_cell": "A4",
-  "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de [MÊS DO RAIO X]",
+  "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de agosto",
   "strip_plan_prefix": "",
   "expected_pages": 3,
   "trim_trailing_junk": true,
