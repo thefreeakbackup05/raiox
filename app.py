@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -110,23 +110,12 @@ def safe_cell_value(sheet, address: str) -> Any:
     return sheet.Range(address).Value
 
 def prepare_excel_for_pdf(workbook):
-    s1 = workbook.Worksheets("LAMINA")
-    s2 = workbook.Worksheets("LAMINA 2")
-    state = {"visible": {ws.Name: ws.Visible for ws in workbook.Worksheets}, "active_sheet": None}
+    # The finished Raio-X is the LAMINA 2 worksheet. LAMINA is an internal
+    # template/technical sheet and must NOT be included in the PDF.
+    sheet = workbook.Worksheets("LAMINA 2")
+    state = {"active_sheet": workbook.ActiveSheet.Name if workbook.ActiveSheet else None}
     try:
-        state["active_sheet"] = workbook.ActiveSheet.Name
-    except Exception:
-        pass
-
-    # Do not rewrite the source workbook's print settings. The received XLSM
-    # already contains the intended print areas/layout. We only select the two
-    # publication sheets so Excel exports them as one PDF.
-    for ws in (s1, s2):
-        if ws.Visible != -1:
-            ws.Visible = -1
-    try:
-        s1.Select()
-        s2.Select(False)
+        sheet.Activate()
     except Exception:
         pass
     return state
@@ -137,29 +126,23 @@ def restore_excel_state(workbook, state):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
-    for name, vis in state.get("visible", {}).items():
-        try:
-            workbook.Worksheets(name).Visible = vis
-        except Exception:
-            pass
 
 def export_pdf(excel, workbook, output: Path):
-    # Export to the user's temp directory first. This separates Excel's PDF
-    # generation from permissions/sync issues in the destination folder.
+    # Export exactly LAMINA 2 using its existing print area/page setup.
+    # This mirrors the manual Excel flow and prevents the blank first page
+    # caused by exporting LAMINA together with LAMINA 2.
     import tempfile
+    import shutil
     temp_pdf = Path(tempfile.gettempdir()) / f"raiox_{os.getpid()}_{int(time.time()*1000)}.pdf"
     state = prepare_excel_for_pdf(workbook)
     try:
-        # With the two sheets selected, ActiveSheet.ExportAsFixedFormat exports
-        # the selected worksheets together. Only the two required positional
-        # arguments are supplied to avoid COM named-argument quirks.
-        workbook.ActiveSheet.ExportAsFixedFormat(0, str(temp_pdf))
+        sheet = workbook.Worksheets("LAMINA 2")
+        sheet.ExportAsFixedFormat(0, str(temp_pdf))
         if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
             raise RuntimeError("O Excel não criou o PDF temporário.")
         output.parent.mkdir(parents=True, exist_ok=True)
         if output.exists():
             output.unlink()
-        import shutil
         shutil.copy2(temp_pdf, output)
     finally:
         restore_excel_state(workbook, state)
