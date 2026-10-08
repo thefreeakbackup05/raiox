@@ -364,7 +364,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         if output_pdf.exists():
             output_pdf.unlink()
 
-        export_workbook_to_pdf(excel, workbook, output_pdf, config)
+        export_pdf(excel, workbook, output_pdf)
         time.sleep(0.25)
 
         with fitz.open(output_pdf) as doc:
