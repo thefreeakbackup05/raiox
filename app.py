@@ -6,6 +6,8 @@ import re
 import sys
 import threading
 import time
+import tempfile
+import shutil
 import traceback
 import math
 import zipfile
@@ -462,6 +464,40 @@ def restore_sheet_excel_state(workbook, state) -> None:
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
+
+
+def export_sheet_pdf(
+    workbook,
+    sheet,
+    temp_output: Path,
+    meta: dict[str, Any],
+    repair_layout: bool = True,
+) -> None:
+    state = prepare_sheet_for_pdf(
+        workbook,
+        sheet,
+        meta,
+        repair_layout,
+    )
+    last_error = None
+    try:
+        sheet.Activate()
+        for attempt in range(1, 4):
+            try:
+                if temp_output.exists():
+                    temp_output.unlink()
+                sheet.ExportAsFixedFormat(0, str(temp_output))
+                if temp_output.exists() and temp_output.stat().st_size > 0:
+                    return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(1.0)
+        raise last_error or RuntimeError(
+            f"O Excel não conseguiu exportar a aba '{sheet.Name}'."
+        )
+    finally:
+        restore_sheet_excel_state(workbook, state)
 
 
 def page_ink_ratio(page: fitz.Page) -> float:
