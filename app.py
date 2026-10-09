@@ -747,7 +747,6 @@ def detect_publication_sheets(workbook) -> tuple[list[str], str]:
     return names, primary
 
 def create_excel_instance():
-def create_excel_instance():
     import pythoncom
     import win32com.client as win32
     pythoncom.CoInitialize()
