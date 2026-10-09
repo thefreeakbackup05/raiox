@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -215,15 +215,24 @@ def _adjust_manual_page_breaks(sheet, meta: dict[str, Any]):
         return
     merges = [_expand_merge_ref(x) for x in meta.get("merges", [])]
     merges = [x for x in merges if x]
+    drawings = list(meta.get("drawings", []))
     adjusted = []
+
     for after_row in original:
         target = after_row
-        for _, start_row, _, end_row in merges:
-            if start_row <= after_row < end_row:
-                target = max(target, end_row)
-        for chart in meta.get("charts", []):
-            if chart["top"] <= after_row < chart["bottom"]:
-                target = max(target, chart["bottom"])
+        changed = True
+        # Move a manual break forward until it sits outside every merged
+        # text block and every substantial drawing it intersects.
+        while changed:
+            changed = False
+            for _, start_row, _, end_row in merges:
+                if start_row <= target < end_row:
+                    target = end_row
+                    changed = True
+            for drawing in drawings:
+                if drawing["top"] <= target < drawing["bottom"]:
+                    target = drawing["bottom"]
+                    changed = True
         adjusted.append(target)
 
     try:
@@ -245,9 +254,34 @@ def _content_bottom(sheet, meta: dict[str, Any]) -> int:
         x = _expand_merge_ref(ref)
         if x:
             last_row = max(last_row, x[3])
-    for chart in meta.get("charts", []):
-        last_row = max(last_row, int(chart["bottom"]))
+    for drawing in meta.get("drawings", []):
+        # Every substantial drawing is content unless it is an obvious
+        # decorative overflow image that starts right at the footer.
+        if drawing.get("chart"):
+            last_row = max(last_row, int(drawing["bottom"]))
     return last_row
+
+def _hide_footer_decorations(sheet, meta: dict[str, Any], content_bottom: int):
+    hidden = []
+    # In the template, the decorative identity graphic can begin a few rows
+    # before the final footer and extend beyond it. Hide only non-chart drawings
+    # in that narrow overflow zone; never hide charts/tables.
+    for drawing in meta.get("drawings", []):
+        if drawing.get("chart"):
+            continue
+        top = int(drawing["top"])
+        bottom = int(drawing["bottom"])
+        if content_bottom - 4 <= top <= content_bottom + 2 and bottom > content_bottom:
+            try:
+                name = drawing.get("name", "")
+                if name:
+                    shape = sheet.Shapes(name)
+                    shape.Visible = 0
+                    hidden.append(shape)
+            except Exception:
+                pass
+    return hidden
+
 
 def _parse_print_area(area_text: str):
     if not area_text:
@@ -267,6 +301,7 @@ def prepare_excel_for_pdf(workbook, layout_meta: Optional[dict[str, Any]] = None
         "zoom": None,
         "fit_wide": None,
         "fit_tall": None,
+        "hidden_shapes": [],
     }
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
@@ -287,24 +322,27 @@ def prepare_excel_for_pdf(workbook, layout_meta: Optional[dict[str, Any]] = None
         area = _parse_print_area(state["print_area"])
         if area:
             first_col, first_row, last_col, print_last_row = area
+            # Extend only downward. Never reduce the original publication width.
+            # This is essential for keeping full footnotes within the PDF.
             final_row = max(print_last_row, content_bottom)
-            sheet.PageSetup.PrintArea = (
-                "$" + first_col + "$" + str(first_row) +
-                ":$" + last_col + "$" + str(final_row)
-            )
+            sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col + "$" + str(final_row)
         else:
+            # Ford-like files have no Print_Area. The publication grid is A:N;
+            # columns beyond N contain auxiliary/template material and should not
+            # determine the PDF width.
             first_row, first_col, last_row, last_col_num = _sheet_bounds(sheet)
-            sheet.PageSetup.PrintArea = (
-                "$" + _xl_col(first_col) + "$" + str(first_row) +
-                ":$" + _xl_col(last_col_num) + "$" + str(max(last_row, content_bottom))
-            )
-            # Ford-like files have no native print area: fit the width only.
-            # Height is automatic so nothing is vertically squeezed/cut.
+            publication_last_row = max(last_row, content_bottom)
+            sheet.PageSetup.PrintArea = "$A$1:$N$" + str(publication_last_row)
             sheet.PageSetup.Zoom = False
             sheet.PageSetup.FitToPagesWide = 1
             sheet.PageSetup.FitToPagesTall = False
     except Exception:
         pass
+
+    try:
+        state["hidden_shapes"] = _hide_footer_decorations(sheet, layout_meta, content_bottom)
+    except Exception:
+        state["hidden_shapes"] = []
 
     _adjust_manual_page_breaks(sheet, layout_meta)
     try:
@@ -326,10 +364,51 @@ def restore_excel_state(workbook, state):
                 sheet.PageSetup.FitToPagesWide = state.get("fit_wide")
             if state.get("fit_tall") is not None:
                 sheet.PageSetup.FitToPagesTall = state.get("fit_tall")
+        for shape in state.get("hidden_shapes", []):
+            try:
+                shape.Visible = -1
+            except Exception:
+                pass
         if state.get("active_sheet"):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
+
+
+def sync_placeholder_text(workbook):
+    copied = []
+    try:
+        source = None
+        dest = None
+        for ws in workbook.Worksheets:
+            nm = ws.Name.strip()
+            if nm == "LAMINA":
+                source = ws
+            elif nm == "LAMINA 2":
+                dest = ws
+        if source is None or dest is None:
+            return copied
+
+        for row in range(1, 400):
+            for col in range(1, 15):
+                try:
+                    dest_cell = dest.Cells(row, col)
+                    val = str(dest_cell.Value or "").strip()
+                    if "NONON" not in val.upper():
+                        continue
+                    src_val = source.Cells(row, col).Value
+                    if src_val not in (None, "") and "NONON" not in str(src_val).upper():
+                        dest_cell.Value = src_val
+                        try:
+                            dest_cell.WrapText = True
+                        except Exception:
+                            pass
+                        copied.append(dest_cell.Address(False, False))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return copied
 
 def _remove_broken_defined_names(workbook) -> int:
     removed = 0
@@ -603,6 +682,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         except Exception:
             pass
 
+        sync_placeholder_text(workbook)
         name, plan, month = output_name(workbook, input_path, config)
         output_pdf = output_dir / name
 
