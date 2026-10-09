@@ -648,6 +648,42 @@ def add_video_hyperlink(pdf_path: Path, link_url: str, trigger_phrases: list[str
             pass
 
 
+def pdf_has_content(pdf_path: Path) -> bool:
+    try:
+        with fitz.open(pdf_path) as doc:
+            if len(doc) == 0:
+                return False
+            for page in doc:
+                if (page.get_text("text") or "").strip():
+                    return True
+                if len(page.get_images(full=True)) > 0:
+                    return True
+                try:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(0.20, 0.20),
+                        alpha=False,
+                    )
+                    if pix.samples:
+                        pixels = len(pix.samples) // pix.n
+                        step = max(1, pixels // 10000)
+                        ink = 0
+                        for n in range(0, pixels, step):
+                            pos = n * pix.n
+                            if (
+                                pix.samples[pos] < 245
+                                or pix.samples[pos + 1] < 245
+                                or pix.samples[pos + 2] < 245
+                            ):
+                                ink += 1
+                        if ink >= 10:
+                            return True
+                except Exception:
+                    pass
+    except Exception:
+        return False
+    return False
+
+
 @dataclass
 class ProcessResult:
     file: str
@@ -1123,39 +1159,4 @@ def _startup_exception_hook(exc_type, exc_value, exc_tb):
 sys.excepthook = _startup_exception_hook
 
 if __name__=="__main__":
-    App().mainloop()def pdf_has_content(pdf_path: Path) -> bool:
-    try:
-        with fitz.open(pdf_path) as doc:
-            if len(doc) == 0:
-                return False
-            for page in doc:
-                if (page.get_text("text") or "").strip():
-                    return True
-                if len(page.get_images(full=True)) > 0:
-                    return True
-                try:
-                    pix = page.get_pixmap(
-                        matrix=fitz.Matrix(0.20, 0.20),
-                        alpha=False,
-                    )
-                    if pix.samples:
-                        pixels = len(pix.samples) // pix.n
-                        step = max(1, pixels // 10000)
-                        ink = 0
-                        for n in range(0, pixels, step):
-                            pos = n * pix.n
-                            if (
-                                pix.samples[pos] < 245
-                                or pix.samples[pos + 1] < 245
-                                or pix.samples[pos + 2] < 245
-                            ):
-                                ink += 1
-                        if ink >= 10:
-                            return True
-                except Exception:
-                    pass
-    except Exception:
-        return False
-    return False
-
-
+    App().mainloop()
