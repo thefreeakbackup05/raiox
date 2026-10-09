@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -128,13 +128,126 @@ def _sheet_bounds(sheet):
             first_row, first_col = first.Row, first.Column
         if last is not None:
             last_row, last_col = last.Row, last.Column
-            if last.MergeCells:
-                area = last.MergeArea
-                last_row = max(last_row, area.Row + area.Rows.Count - 1)
-                last_col = max(last_col, area.Column + area.Columns.Count - 1)
     except Exception:
         pass
     return first_row, first_col, last_row, last_col
+
+def read_layout_metadata(input_path: Path) -> dict[str, Any]:
+    # Read merges/manual page breaks/chart anchors directly from the XLSX/XLSM
+    # package. This avoids guessing from visual output and is fast enough for
+    # a monthly batch of files.
+    meta = {"merges": [], "manual_breaks": [], "charts": []}
+    try:
+        ns = {
+            "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+            "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        }
+        with zipfile.ZipFile(input_path, "r") as z:
+            wb_root = ET.fromstring(z.read("xl/workbook.xml"))
+            rel_root = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            rels = {e.attrib["Id"]: e.attrib["Target"] for e in rel_root}
+
+            target = None
+            for sh in wb_root.findall("m:sheets/m:sheet", ns):
+                if sh.attrib.get("name") == "LAMINA 2":
+                    rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                    target = rels.get(rid)
+                    break
+            if not target:
+                return meta
+
+            sheet_path = os.path.normpath(os.path.join("xl", target))
+            root = ET.fromstring(z.read(sheet_path))
+
+            merge_node = root.find("m:mergeCells", ns)
+            if merge_node is not None:
+                meta["merges"] = [x.attrib["ref"] for x in merge_node if x.attrib.get("ref")]
+
+            rb = root.find("m:rowBreaks", ns)
+            if rb is not None:
+                for br in rb:
+                    if br.attrib.get("man") == "1":
+                        try:
+                            meta["manual_breaks"].append(int(br.attrib.get("id", "0")))
+                        except Exception:
+                            pass
+
+            drawing = root.find("m:drawing", ns)
+            if drawing is not None:
+                sheet_rel_path = os.path.dirname(sheet_path) + "/_rels/" + os.path.basename(sheet_path) + ".rels"
+                srel = ET.fromstring(z.read(sheet_rel_path))
+                srela = {e.attrib["Id"]: e.attrib["Target"] for e in srel}
+                drid = drawing.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                drtarget = srela.get(drid)
+                if drtarget:
+                    dpath = os.path.normpath(os.path.join(os.path.dirname(sheet_path), drtarget))
+                    droot = ET.fromstring(z.read(dpath))
+                    for anchor in list(droot):
+                        if anchor.tag.split("}")[-1] not in ("twoCellAnchor", "oneCellAnchor"):
+                            continue
+                        fr = anchor.find("xdr:from", ns)
+                        to = anchor.find("xdr:to", ns)
+                        if fr is None:
+                            continue
+                        fr_row = fr.find("xdr:row", ns)
+                        to_row = to.find("xdr:row", ns)
+                        if fr_row is None:
+                            continue
+                        top = int(fr_row.text) + 1
+                        bottom = int(to_row.text) + 1 if to_row is not None else top
+                        if anchor.find(".//c:chart", ns) is not None:
+                            meta["charts"].append({"top": top, "bottom": bottom})
+    except Exception:
+        pass
+    return meta
+
+def _expand_merge_ref(ref: str):
+    m = re.fullmatch(r"\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", str(ref))
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+
+def _adjust_manual_page_breaks(sheet, meta: dict[str, Any]):
+    original = sorted(set(x for x in meta.get("manual_breaks", []) if x > 0))
+    if not original:
+        return
+    merges = [_expand_merge_ref(x) for x in meta.get("merges", [])]
+    merges = [x for x in merges if x]
+    adjusted = []
+    for after_row in original:
+        target = after_row
+        for _, start_row, _, end_row in merges:
+            if start_row <= after_row < end_row:
+                target = max(target, end_row)
+        for chart in meta.get("charts", []):
+            if chart["top"] <= after_row < chart["bottom"]:
+                target = max(target, chart["bottom"])
+        adjusted.append(target)
+
+    try:
+        for i in range(sheet.HPageBreaks.Count, 0, -1):
+            pb = sheet.HPageBreaks.Item(i)
+            try:
+                if int(pb.Type) == -4135:
+                    pb.Delete()
+            except Exception:
+                pass
+        for after_row in sorted(set(adjusted)):
+            sheet.HPageBreaks.Add(sheet.Cells(after_row + 1, 1))
+    except Exception:
+        pass
+
+def _content_bottom(sheet, meta: dict[str, Any]) -> int:
+    _, _, last_row, _ = _sheet_bounds(sheet)
+    for ref in meta.get("merges", []):
+        x = _expand_merge_ref(ref)
+        if x:
+            last_row = max(last_row, x[3])
+    for chart in meta.get("charts", []):
+        last_row = max(last_row, int(chart["bottom"]))
+    return last_row
 
 def _parse_print_area(area_text: str):
     if not area_text:
@@ -144,7 +257,8 @@ def _parse_print_area(area_text: str):
         return None
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
 
-def prepare_excel_for_pdf(workbook):
+def prepare_excel_for_pdf(workbook, layout_meta: Optional[dict[str, Any]] = None):
+    layout_meta = layout_meta or {}
     sheet = workbook.Worksheets("LAMINA 2")
     state = {
         "active_sheet": None,
@@ -153,7 +267,6 @@ def prepare_excel_for_pdf(workbook):
         "zoom": None,
         "fit_wide": None,
         "fit_tall": None,
-        "orientation": None,
     }
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
@@ -165,25 +278,35 @@ def prepare_excel_for_pdf(workbook):
         state["zoom"] = sheet.PageSetup.Zoom
         state["fit_wide"] = sheet.PageSetup.FitToPagesWide
         state["fit_tall"] = sheet.PageSetup.FitToPagesTall
-        state["orientation"] = sheet.PageSetup.Orientation
     except Exception:
         pass
 
+    content_bottom = _content_bottom(sheet, layout_meta)
+
     try:
-        first_row, first_col, last_row, last_col = _sheet_bounds(sheet)
         area = _parse_print_area(state["print_area"])
         if area:
-            first_col_name, area_first_row, area_last_col, area_last_row = area
-            final_row = max(area_last_row, last_row)
-            sheet.PageSetup.PrintArea = "$" + first_col_name + "$" + str(area_first_row) + ":$" + area_last_col + "$" + str(final_row)
+            first_col, first_row, last_col, print_last_row = area
+            final_row = max(print_last_row, content_bottom)
+            sheet.PageSetup.PrintArea = (
+                "$" + first_col + "$" + str(first_row) +
+                ":$" + last_col + "$" + str(final_row)
+            )
         else:
-            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col) + "$" + str(last_row)
+            first_row, first_col, last_row, last_col_num = _sheet_bounds(sheet)
+            sheet.PageSetup.PrintArea = (
+                "$" + _xl_col(first_col) + "$" + str(first_row) +
+                ":$" + _xl_col(last_col_num) + "$" + str(max(last_row, content_bottom))
+            )
+            # Ford-like files have no native print area: fit the width only.
+            # Height is automatic so nothing is vertically squeezed/cut.
             sheet.PageSetup.Zoom = False
             sheet.PageSetup.FitToPagesWide = 1
             sheet.PageSetup.FitToPagesTall = False
     except Exception:
         pass
 
+    _adjust_manual_page_breaks(sheet, layout_meta)
     try:
         sheet.Activate()
     except Exception:
@@ -222,8 +345,8 @@ def _remove_broken_defined_names(workbook) -> int:
         pass
     return removed
 
-def export_pdf(excel, workbook, output: Path):
-    state = prepare_excel_for_pdf(workbook)
+def export_pdf(excel, workbook, output: Path, layout_meta: Optional[dict[str, Any]] = None):
+    state = prepare_excel_for_pdf(workbook, layout_meta)
     last_error = None
     try:
         sheet = workbook.Worksheets("LAMINA 2")
@@ -238,7 +361,6 @@ def export_pdf(excel, workbook, output: Path):
                 last_error = exc
                 time.sleep(1.0)
 
-        # Ford fallback: remove only broken workbook names in memory.
         try:
             removed = _remove_broken_defined_names(workbook)
             if removed:
@@ -251,18 +373,20 @@ def export_pdf(excel, workbook, output: Path):
         except Exception as exc:
             last_error = exc
 
-        # Last fallback: hide other sheets and export workbook.
         visible = {}
         try:
             for ws in workbook.Worksheets:
-                visible[ws.Name] = ws.Visible
-                if ws.Name != "LAMINA 2":
+                try:
+                    visible[ws.Name] = ws.Visible
+                except Exception:
+                    continue
+                if ws.Name == "LAMINA 2":
+                    ws.Visible = -1
+                else:
                     try:
                         ws.Visible = 0
                     except Exception:
                         pass
-                else:
-                    ws.Visible = -1
             sheet.Activate()
             if Path(output).exists():
                 Path(output).unlink()
@@ -469,6 +593,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         import tempfile
         import shutil
 
+        layout_meta = read_layout_metadata(input_path)
         workbook = excel.Workbooks.Open(
             str(input_path), UpdateLinks=0, ReadOnly=True,
             IgnoreReadOnlyRecommended=True, AddToMru=False
@@ -485,7 +610,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
             raise FileExistsError(f"Arquivo já existe: {output_pdf.name}")
 
         working_pdf = Path(tempfile.gettempdir()) / f"raiox_work_{os.getpid()}_{time.time_ns()}.pdf"
-        had_native_print_area = export_pdf(excel, workbook, working_pdf)
+        had_native_print_area = export_pdf(excel, workbook, working_pdf, layout_meta)
         time.sleep(0.25)
 
         with fitz.open(working_pdf) as doc:
