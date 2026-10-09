@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -117,20 +117,24 @@ def _xl_col(n):
 
 def _sheet_bounds(sheet):
     used = sheet.UsedRange
+    first_row = max(1, used.Row)
+    first_col = max(1, used.Column)
     last_row = max(1, used.Row + used.Rows.Count - 1)
     last_col = max(1, used.Column + used.Columns.Count - 1)
     try:
-        cell = used.Find("*", None, -4163, 1, 1, 2, False, False, False)
-        if cell is not None:
-            last_row = cell.Row
-            last_col = cell.Column
-            if cell.MergeCells:
-                area = cell.MergeArea
+        first = used.Find("*", None, -4163, 1, 1, 1, False, False, False)
+        last = used.Find("*", None, -4163, 1, 1, 2, False, False, False)
+        if first is not None:
+            first_row, first_col = first.Row, first.Column
+        if last is not None:
+            last_row, last_col = last.Row, last.Column
+            if last.MergeCells:
+                area = last.MergeArea
                 last_row = max(last_row, area.Row + area.Rows.Count - 1)
                 last_col = max(last_col, area.Column + area.Columns.Count - 1)
     except Exception:
         pass
-    return last_row, last_col
+    return first_row, first_col, last_row, last_col
 
 def _parse_print_area(area_text: str):
     if not area_text:
@@ -149,38 +153,35 @@ def prepare_excel_for_pdf(workbook):
         "zoom": None,
         "fit_wide": None,
         "fit_tall": None,
+        "orientation": None,
     }
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
         pass
-
     try:
         state["print_area"] = sheet.PageSetup.PrintArea
         state["had_print_area"] = bool(state["print_area"])
         state["zoom"] = sheet.PageSetup.Zoom
         state["fit_wide"] = sheet.PageSetup.FitToPagesWide
         state["fit_tall"] = sheet.PageSetup.FitToPagesTall
+        state["orientation"] = sheet.PageSetup.Orientation
     except Exception:
         pass
 
-    last_row, last_col = _sheet_bounds(sheet)
-    area = _parse_print_area(state["print_area"])
     try:
+        first_row, first_col, last_row, last_col = _sheet_bounds(sheet)
+        area = _parse_print_area(state["print_area"])
         if area:
-            first_col, first_row, last_col_name, print_last_row = area
-            # Extend, never shrink: this is what restores merged footnotes
-            # that sit below the old print-area boundary.
-            final_row = max(print_last_row, last_row)
-            sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col_name + "$" + str(final_row)
+            first_col_name, area_first_row, area_last_col, area_last_row = area
+            final_row = max(area_last_row, last_row)
+            sheet.PageSetup.PrintArea = "$" + first_col_name + "$" + str(area_first_row) + ":$" + area_last_col + "$" + str(final_row)
         else:
-            # Ford has no native print area. Define one from actual content.
-            sheet.PageSetup.PrintArea = "$A$1:$" + _xl_col(last_col) + "$" + str(last_row)
+            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col) + "$" + str(last_row)
             sheet.PageSetup.Zoom = False
             sheet.PageSetup.FitToPagesWide = 1
             sheet.PageSetup.FitToPagesTall = False
     except Exception:
-        # Leave the source page setup alone if Excel refuses a temporary change.
         pass
 
     try:
@@ -207,6 +208,20 @@ def restore_excel_state(workbook, state):
     except Exception:
         pass
 
+def _remove_broken_defined_names(workbook) -> int:
+    removed = 0
+    try:
+        for name in list(workbook.Names):
+            try:
+                if "#REF!" in str(name.RefersTo):
+                    name.Delete()
+                    removed += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return removed
+
 def export_pdf(excel, workbook, output: Path):
     state = prepare_excel_for_pdf(workbook)
     last_error = None
@@ -223,21 +238,31 @@ def export_pdf(excel, workbook, output: Path):
                 last_error = exc
                 time.sleep(1.0)
 
-        # Fallback for atypical files such as Ford.
+        # Ford fallback: remove only broken workbook names in memory.
+        try:
+            removed = _remove_broken_defined_names(workbook)
+            if removed:
+                time.sleep(0.5)
+                if Path(output).exists():
+                    Path(output).unlink()
+                sheet.ExportAsFixedFormat(0, str(output))
+                if Path(output).exists() and Path(output).stat().st_size > 0:
+                    return state.get("had_print_area", False)
+        except Exception as exc:
+            last_error = exc
+
+        # Last fallback: hide other sheets and export workbook.
         visible = {}
         try:
             for ws in workbook.Worksheets:
-                try:
-                    visible[ws.Name] = ws.Visible
-                except Exception:
-                    continue
-                if ws.Name == "LAMINA 2":
-                    ws.Visible = -1
-                else:
+                visible[ws.Name] = ws.Visible
+                if ws.Name != "LAMINA 2":
                     try:
                         ws.Visible = 0
                     except Exception:
                         pass
+                else:
+                    ws.Visible = -1
             sheet.Activate()
             if Path(output).exists():
                 Path(output).unlink()
