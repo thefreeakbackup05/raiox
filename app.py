@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -371,7 +371,7 @@ def _repair_automatic_page_breaks(sheet, merges: list[str]) -> None:
 
 
 def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]] = None, repair_layout: bool = True):
-    meta = layout_meta or {}
+    meta = layout_meta if isinstance(layout_meta, dict) else {}
     state = {
         "name": sheet.Name,
         "active_sheet": None,
@@ -647,20 +647,39 @@ def infer_month_from_filename(path: Path) -> Optional[str]:
             return MONTHS_PT[num]
     return None
 
-def output_name(workbook, input_path: Path, config: dict[str, Any], primary_sheet_name: Optional[str] = None) -> tuple[str, str, str]:
+def output_name(workbook, input_path: Path, config: dict[str, Any], primary_sheet_name: Optional[str] = None) -> str:
+    if not isinstance(config, dict):
+        raise TypeError("Configuração interna inválida: esperava um objeto.")
     sheet_name = primary_sheet_name or config.get("plan_sheet", "LAMINA 2")
     ws_plan = workbook.Worksheets(sheet_name)
     plan = str(safe_cell_value(ws_plan, config.get("plan_cell", "A8")) or "").strip()
-    strip_prefix = str(config.get("strip_plan_prefix", ""))
-    if strip_prefix and plan.casefold().startswith(strip_prefix.casefold()):
-        plan = plan[len(strip_prefix):].strip()
+
+    if not plan:
+        for candidate in ("LAMINA 2", "LAMINA"):
+            try:
+                value = str(safe_cell_value(workbook.Worksheets(candidate), "A8") or "").strip()
+                if value:
+                    plan = value
+                    break
+            except Exception:
+                pass
+
+    prefix = str(config.get("strip_plan_prefix", ""))
+    if prefix and plan.casefold().startswith(prefix.casefold()):
+        plan = plan[len(prefix):].strip()
+
     if not plan:
         raise ValueError(f"Não foi possível determinar o nome do plano em {input_path.name}")
+
     pattern = str(config.get("output_pattern", DEFAULT_CONFIG["output_pattern"]))
     if "[MÊS DO RAIO X]" in pattern:
-        raise ValueError("A regra de nome ainda contém [MÊS DO RAIO X]. Digite o mês diretamente na regra.")
-    name = pattern.replace("[NOME DO PLANO NO EXCEL]", plan)
-    return clean_filename(name) + ".pdf", plan, ""
+        raise ValueError(
+            "A regra de nome ainda contém [MÊS DO RAIO X]. "
+            "Escreva o mês diretamente na regra."
+        )
+
+    return clean_filename(pattern.replace("[NOME DO PLANO NO EXCEL]", plan)) + ".pdf"
+
 
 def _sheet_period(sheet) -> Optional[datetime]:
     try:
@@ -732,6 +751,8 @@ def create_excel_instance():
     return excel
 
 def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any]) -> ProcessResult:
+    if not isinstance(config, dict):
+        raise TypeError("Configuração interna inválida: esperava um objeto.")
     result = ProcessResult(file=input_path.name)
     temp_root = Path(tempfile.mkdtemp(prefix="raiox_"))
     temp_input = temp_root / input_path.name
@@ -855,6 +876,8 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
 
 
 def worker(config: dict[str, Any], callback) -> None:
+    if not isinstance(config, dict):
+        raise TypeError("Configuração interna inválida: esperava um objeto.")
     input_dir = Path(config["input_dir"]).expanduser()
     output_dir = Path(config["output_dir"]).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
