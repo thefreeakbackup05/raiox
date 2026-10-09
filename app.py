@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -183,8 +183,9 @@ def _expand_merge_ref(ref: str):
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
 
 def _set_long_text_visibility(sheet, merges: list[str]) -> None:
-    # Excel AutoFit does not reliably size merged cells. Enable wrapping and
-    # increase the total merged-row height conservatively, never shrinking text.
+    # Long explanatory texts are commonly stored in merged cells. Excel's
+    # AutoFit is unreliable for merged ranges, so enable wrapping and ensure
+    # the combined row height can hold the complete text.
     for ref in merges:
         try:
             rng = sheet.Range(ref)
@@ -194,13 +195,14 @@ def _set_long_text_visibility(sheet, merges: list[str]) -> None:
 
             rng.WrapText = True
             rng.ShrinkToFit = False
+
             try:
                 rng.Rows.AutoFit()
             except Exception:
                 pass
 
             try:
-                width_pt = max(40.0, float(rng.Width))
+                width_pt = max(50.0, float(rng.Width))
             except Exception:
                 width_pt = 360.0
             try:
@@ -211,14 +213,14 @@ def _set_long_text_visibility(sheet, merges: list[str]) -> None:
                 font_size = 10.0
 
             chars_per_line = max(18, int(width_pt / max(font_size * 0.50, 4.0)))
-            lines = 0
+            line_count = 0
             for paragraph in value.replace("\r", "").split("\n"):
                 if not paragraph:
-                    lines += 1
+                    line_count += 1
                 else:
-                    lines += max(1, int(math.ceil(len(paragraph) / chars_per_line)))
+                    line_count += max(1, int(math.ceil(len(paragraph) / chars_per_line)))
 
-            required_total = lines * max(14.0, font_size * 1.35) + 6.0
+            required_total = line_count * max(14.0, font_size * 1.35) + 6.0
             try:
                 current_total = float(rng.Height)
             except Exception:
@@ -231,6 +233,22 @@ def _set_long_text_visibility(sheet, merges: list[str]) -> None:
                     pass
         except Exception:
             pass
+
+    # Protect long non-merged cells too.
+    try:
+        for cell in sheet.UsedRange.Cells:
+            try:
+                value = cell.Value
+                if isinstance(value, str) and len(value.strip()) >= 100 and not cell.MergeCells:
+                    cell.WrapText = True
+                    try:
+                        cell.EntireRow.AutoFit()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 def _get_content_shapes(sheet) -> list[dict[str, int]]:
     shapes = []
@@ -253,6 +271,8 @@ def _get_content_shapes(sheet) -> list[dict[str, int]]:
 
             height_rows = max(0, bottom - top)
             width_cols = max(0, right - left)
+            # Every chart is protected. Large in-content images/tables are
+            # protected as well; tiny header logos are ignored.
             if has_chart or (top > 10 and (height_rows >= 4 or width_cols >= 4)):
                 shapes.append({"top": top, "bottom": bottom})
         except Exception:
@@ -260,12 +280,11 @@ def _get_content_shapes(sheet) -> list[dict[str, int]]:
     return shapes
 
 def _safe_break_row(break_after_row: int, merges: list[str], shapes: list[dict[str, int]]) -> int:
-    # RowBreak id is the last row of the previous page; Excel's break location
-    # is the first row of the next page.
     target = int(break_after_row) + 1
     changed = True
     while changed:
         changed = False
+
         for ref in merges:
             parsed = _expand_merge_ref(ref)
             if parsed:
@@ -273,6 +292,7 @@ def _safe_break_row(break_after_row: int, merges: list[str], shapes: list[dict[s
                 if start_row < target <= end_row:
                     target = end_row + 1
                     changed = True
+
         for shape in shapes:
             if shape["top"] < target <= shape["bottom"]:
                 target = shape["bottom"] + 1
@@ -289,8 +309,7 @@ def _apply_safe_manual_breaks(sheet, meta: dict[str, Any]) -> None:
     targets = sorted(set(_safe_break_row(x, merges, shapes) for x in original))
 
     try:
-        # Delete existing manual breaks only. Automatic breaks remain under
-        # Excel's FitToPages settings.
+        # Remove and recreate only the source's manual breaks at safe rows.
         for i in range(int(sheet.HPageBreaks.Count), 0, -1):
             pb = sheet.HPageBreaks.Item(i)
             try:
@@ -364,7 +383,8 @@ def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]]
             sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col + "$" + str(final_row)
         else:
             first_row, first_col, last_row, last_col_num = _sheet_bounds(sheet)
-            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col_num) + "$" + str(max(last_row, content_bottom))
+            final_row = max(last_row, content_bottom)
+            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col_num) + "$" + str(final_row)
 
         sheet.PageSetup.Zoom = False
         sheet.PageSetup.FitToPagesWide = 1
@@ -375,8 +395,6 @@ def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]]
     except Exception:
         pass
 
-    # Move source manual breaks out of merged blocks and objects before Excel
-    # paginates the sheet.
     _apply_safe_manual_breaks(sheet, layout_meta)
 
     try:
@@ -455,13 +473,28 @@ def _remove_broken_defined_names(workbook) -> int:
         pass
     return removed
 
-def export_pdf(excel, workbook, output: Path, publication_sheets: list[str], layout_meta_by_sheet: Optional[dict[str, dict[str, Any]]] = None):
-    states = []
+def export_pdf(
+    excel,
+    workbook,
+    output: Path,
+    publication_sheets: list[str],
+    layout_meta_by_sheet: Optional[dict[str, dict[str, Any]]] = None,
+    pages_tall_by_sheet: Optional[dict[str, Any]] = None,
+):
     layout_meta_by_sheet = layout_meta_by_sheet or {}
+    pages_tall_by_sheet = pages_tall_by_sheet or {}
+    states = []
     try:
         for name in publication_sheets:
             ws = workbook.Worksheets(name)
-            states.append(prepare_sheet_for_pdf(workbook, ws, layout_meta_by_sheet.get(name, {})))
+            states.append(
+                prepare_sheet_for_pdf(
+                    workbook,
+                    ws,
+                    layout_meta_by_sheet.get(name, {}),
+                    pages_tall=pages_tall_by_sheet.get(name, False),
+                )
+            )
 
         if len(publication_sheets) == 1:
             sheet = workbook.Worksheets(publication_sheets[0])
@@ -478,8 +511,6 @@ def export_pdf(excel, workbook, output: Path, publication_sheets: list[str], lay
                         time.sleep(1.0)
             raise RuntimeError("O Excel não conseguiu exportar a lâmina de publicação para PDF.")
 
-        # Multi-page publication: select the publication sheets exactly as a
-        # user would in Excel, then export the active selection.
         first = workbook.Worksheets(publication_sheets[0])
         first.Activate()
         first.Select()
@@ -805,7 +836,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         shutil.copy2(working_pdf, output_pdf)
         result.output = output_pdf.name
 
-        if result.pages_after != expected:
+        if expected and result.pages_after != expected:
             result.status = "ATENÇÃO"
             result.detail = f"{result.pages_after} páginas (esperadas {expected})"
         elif video_found and not link_added:
