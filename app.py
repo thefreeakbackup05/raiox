@@ -17,7 +17,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -108,15 +108,81 @@ def excel_date_to_datetime(value: Any) -> Optional[datetime]:
 def safe_cell_value(sheet, address: str) -> Any:
     return sheet.Range(address).Value
 
+def _xl_col(n):
+    s = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        s = chr(65 + rem) + s
+    return s
+
+def _sheet_bounds(sheet):
+    used = sheet.UsedRange
+    last_row = max(1, used.Row + used.Rows.Count - 1)
+    last_col = max(1, used.Column + used.Columns.Count - 1)
+    try:
+        cell = used.Find("*", None, -4163, 1, 1, 2, False, False, False)
+        if cell is not None:
+            last_row = cell.Row
+            last_col = cell.Column
+            if cell.MergeCells:
+                area = cell.MergeArea
+                last_row = max(last_row, area.Row + area.Rows.Count - 1)
+                last_col = max(last_col, area.Column + area.Columns.Count - 1)
+    except Exception:
+        pass
+    return last_row, last_col
+
+def _parse_print_area(area_text: str):
+    if not area_text:
+        return None
+    m = re.search(r"\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", str(area_text))
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+
 def prepare_excel_for_pdf(workbook):
-    # Preserve the original print area and page setup from each received file.
-    # The publication is the LAMINA 2 worksheet only.
     sheet = workbook.Worksheets("LAMINA 2")
-    state = {"active_sheet": None}
+    state = {
+        "active_sheet": None,
+        "print_area": None,
+        "had_print_area": False,
+        "zoom": None,
+        "fit_wide": None,
+        "fit_tall": None,
+    }
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
         pass
+
+    try:
+        state["print_area"] = sheet.PageSetup.PrintArea
+        state["had_print_area"] = bool(state["print_area"])
+        state["zoom"] = sheet.PageSetup.Zoom
+        state["fit_wide"] = sheet.PageSetup.FitToPagesWide
+        state["fit_tall"] = sheet.PageSetup.FitToPagesTall
+    except Exception:
+        pass
+
+    last_row, last_col = _sheet_bounds(sheet)
+    area = _parse_print_area(state["print_area"])
+    try:
+        if area:
+            first_col, first_row, last_col_name, print_last_row = area
+            # Extend, never shrink: this is what restores merged footnotes
+            # that sit below the old print-area boundary.
+            final_row = max(print_last_row, last_row)
+            sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col_name + "$" + str(final_row)
+        else:
+            # Ford has no native print area. Define one from actual content.
+            sheet.PageSetup.PrintArea = "$A$1:$" + _xl_col(last_col) + "$" + str(last_row)
+            sheet.PageSetup.Zoom = False
+            sheet.PageSetup.FitToPagesWide = 1
+            sheet.PageSetup.FitToPagesTall = False
+    except Exception:
+        # Leave the source page setup alone if Excel refuses a temporary change.
+        pass
+
     try:
         sheet.Activate()
     except Exception:
@@ -125,35 +191,71 @@ def prepare_excel_for_pdf(workbook):
 
 def restore_excel_state(workbook, state):
     try:
+        sheet = workbook.Worksheets("LAMINA 2")
+        if state.get("had_print_area"):
+            sheet.PageSetup.PrintArea = state.get("print_area")
+        else:
+            sheet.PageSetup.PrintArea = ""
+            if state.get("zoom") is not None:
+                sheet.PageSetup.Zoom = state.get("zoom")
+            if state.get("fit_wide") is not None:
+                sheet.PageSetup.FitToPagesWide = state.get("fit_wide")
+            if state.get("fit_tall") is not None:
+                sheet.PageSetup.FitToPagesTall = state.get("fit_tall")
         if state.get("active_sheet"):
             workbook.Worksheets(state["active_sheet"]).Activate()
     except Exception:
         pass
 
 def export_pdf(excel, workbook, output: Path):
-    # Export LAMINA 2 exactly as configured in the source workbook.
-    # No fixed PrintArea, no fixed scaling and no shape hiding: this avoids
-    # cutting charts/tables that differ in size between plans.
     state = prepare_excel_for_pdf(workbook)
     last_error = None
     try:
         sheet = workbook.Worksheets("LAMINA 2")
-        sheet.Activate()
         for attempt in range(1, 4):
             try:
                 if Path(output).exists():
                     Path(output).unlink()
                 sheet.ExportAsFixedFormat(0, str(output))
-                if not Path(output).exists() or Path(output).stat().st_size == 0:
-                    raise RuntimeError("O Excel não criou o PDF.")
-                return
+                if Path(output).exists() and Path(output).stat().st_size > 0:
+                    return state.get("had_print_area", False)
             except Exception as exc:
                 last_error = exc
-                if attempt < 3:
-                    time.sleep(1.0)
+                time.sleep(1.0)
+
+        # Fallback for atypical files such as Ford.
+        visible = {}
+        try:
+            for ws in workbook.Worksheets:
+                try:
+                    visible[ws.Name] = ws.Visible
+                except Exception:
+                    continue
+                if ws.Name == "LAMINA 2":
+                    ws.Visible = -1
+                else:
+                    try:
+                        ws.Visible = 0
+                    except Exception:
+                        pass
+            sheet.Activate()
+            if Path(output).exists():
+                Path(output).unlink()
+            workbook.ExportAsFixedFormat(0, str(output))
+            if Path(output).exists() and Path(output).stat().st_size > 0:
+                return state.get("had_print_area", False)
+        except Exception as exc:
+            last_error = exc
+        finally:
+            for name, vis in visible.items():
+                try:
+                    workbook.Worksheets(name).Visible = vis
+                except Exception:
+                    pass
         raise last_error or RuntimeError("Falha na exportação para PDF.")
     finally:
         restore_excel_state(workbook, state)
+
 
 def page_ink_ratio(page: fitz.Page) -> float:
     try:
@@ -358,13 +460,14 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
             raise FileExistsError(f"Arquivo já existe: {output_pdf.name}")
 
         working_pdf = Path(tempfile.gettempdir()) / f"raiox_work_{os.getpid()}_{time.time_ns()}.pdf"
-        export_pdf(excel, workbook, working_pdf)
+        had_native_print_area = export_pdf(excel, workbook, working_pdf)
         time.sleep(0.25)
 
         with fitz.open(working_pdf) as doc:
             result.pages_before = len(doc)
 
-        expected = int(config.get("expected_pages", 3))
+        configured_expected = int(config.get("expected_pages", 3))
+        expected = configured_expected if had_native_print_area else 0
         if config.get("trim_trailing_junk", True):
             result.pages_before, result.pages_after = trim_extra_pages(working_pdf, expected)
         else:
@@ -471,7 +574,7 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=18)
         root.pack(fill="both", expand=True)
         ttk.Label(root, text="GERADOR DE RAIO-X DE INVESTIMENTOS", font=("Segoe UI", 17, "bold")).pack(anchor="w")
-        ttk.Label(root, text="XLSM → PDF + hyperlink + correção de páginas + renomeação automática").pack(anchor="w", pady=(2,14))
+        ttk.Label(root, text="XLSX/XLSM → PDF + preservação do conteúdo + hyperlink").pack(anchor="w", pady=(2,14))
 
         frm = ttk.LabelFrame(root, text="Configurações", padding=12)
         frm.pack(fill="x")
@@ -493,7 +596,7 @@ class App(tk.Tk):
         self._field(frm,4,"Palavra clicável",self.click_var)
         self._field(frm,5,"Regra de nome",self.pattern_var)
         self._field(frm,6,"Prefixo a remover (opcional)",self.strip_prefix_var)
-        self._field(frm,7,"Páginas esperadas",self.expected_pages_var)
+        self._field(frm,7,"Páginas esperadas (0 = automático)",self.expected_pages_var)
 
         btns=ttk.Frame(root); btns.pack(fill="x",pady=14)
         self.generate_btn=ttk.Button(btns,text="GERAR TODOS",command=self.start_generation)
