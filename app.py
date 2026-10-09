@@ -7,6 +7,9 @@ import sys
 import threading
 import time
 import traceback
+import math
+import zipfile
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -17,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -135,11 +138,8 @@ def _sheet_bounds(sheet):
 def read_layout_metadata(input_path: Path, sheet_name: str) -> dict[str, Any]:
     meta = {"merges": [], "manual_breaks": []}
     try:
-        ns = {
-            "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        }
-        wanted_name = sheet_name.strip()
+        ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        wanted = sheet_name.strip()
 
         with zipfile.ZipFile(input_path, "r") as z:
             wb_root = ET.fromstring(z.read("xl/workbook.xml"))
@@ -148,7 +148,7 @@ def read_layout_metadata(input_path: Path, sheet_name: str) -> dict[str, Any]:
 
             target = None
             for sh in wb_root.findall("m:sheets/m:sheet", ns):
-                if sh.attrib.get("name", "").strip() == wanted_name:
+                if sh.attrib.get("name", "").strip() == wanted:
                     rid = sh.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
                     target = rels.get(rid)
                     break
@@ -162,11 +162,13 @@ def read_layout_metadata(input_path: Path, sheet_name: str) -> dict[str, Any]:
             if merge_node is not None:
                 meta["merges"] = [x.attrib["ref"] for x in merge_node if x.attrib.get("ref")]
 
-            rb = root.find("m:rowBreaks", ns)
-            if rb is not None:
-                for br in rb:
+            row_breaks = root.find("m:rowBreaks", ns)
+            if row_breaks is not None:
+                for br in row_breaks:
                     try:
-                        meta["manual_breaks"].append(int(br.attrib.get("id", "0")))
+                        row = int(br.attrib.get("id", "0"))
+                        if row > 0:
+                            meta["manual_breaks"].append(row)
                     except Exception:
                         pass
     except Exception:
@@ -180,35 +182,57 @@ def _expand_merge_ref(ref: str):
         return None
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
 
-def _adjust_break_to_content(sheet, break_row: int, merges: list[str], content_shapes: list[dict[str, int]]) -> int:
-    target = max(1, int(break_row))
-    changed = True
-    while changed:
-        changed = False
+def _set_long_text_visibility(sheet, merges: list[str]) -> None:
+    # Excel AutoFit does not reliably size merged cells. Enable wrapping and
+    # increase the total merged-row height conservatively, never shrinking text.
+    for ref in merges:
+        try:
+            rng = sheet.Range(ref)
+            value = rng.Cells(1, 1).Value
+            if not isinstance(value, str) or len(value.strip()) < 50:
+                continue
 
-        for ref in merges:
-            parsed = _expand_merge_ref(ref)
-            if parsed:
-                _, start_row, _, end_row = parsed
-                # HPageBreaks.Location.Row is the first row of the next page.
-                if start_row < target <= end_row:
-                    new_target = end_row + 1
-                    if new_target != target:
-                        target = new_target
-                        changed = True
+            rng.WrapText = True
+            rng.ShrinkToFit = False
+            try:
+                rng.Rows.AutoFit()
+            except Exception:
+                pass
 
-        for shape in content_shapes:
-            top = int(shape["top"])
-            bottom = int(shape["bottom"])
-            if top < target <= bottom:
-                new_target = bottom + 1
-                if new_target != target:
-                    target = new_target
-                    changed = True
+            try:
+                width_pt = max(40.0, float(rng.Width))
+            except Exception:
+                width_pt = 360.0
+            try:
+                font_size = float(rng.Cells(1, 1).Font.Size)
+                if font_size <= 0:
+                    font_size = 10.0
+            except Exception:
+                font_size = 10.0
 
-    return target
+            chars_per_line = max(18, int(width_pt / max(font_size * 0.50, 4.0)))
+            lines = 0
+            for paragraph in value.replace("\r", "").split("\n"):
+                if not paragraph:
+                    lines += 1
+                else:
+                    lines += max(1, int(math.ceil(len(paragraph) / chars_per_line)))
 
-def _get_content_shapes(sheet, content_bottom: int) -> list[dict[str, int]]:
+            required_total = lines * max(14.0, font_size * 1.35) + 6.0
+            try:
+                current_total = float(rng.Height)
+            except Exception:
+                current_total = 0.0
+
+            if required_total > current_total:
+                try:
+                    rng.Rows.RowHeight = required_total / max(1, int(rng.Rows.Count))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+def _get_content_shapes(sheet) -> list[dict[str, int]]:
     shapes = []
     try:
         count = int(sheet.Shapes.Count)
@@ -220,58 +244,62 @@ def _get_content_shapes(sheet, content_bottom: int) -> list[dict[str, int]]:
             shape = sheet.Shapes.Item(i)
             top = int(shape.TopLeftCell.Row)
             bottom = int(shape.BottomRightCell.Row)
-            has_chart = False
+            left = int(shape.TopLeftCell.Column)
+            right = int(shape.BottomRightCell.Column)
             try:
                 has_chart = bool(shape.HasChart)
             except Exception:
-                try:
-                    has_chart = int(shape.Type) in (3, 11, 12, 13)
-                except Exception:
-                    has_chart = False
+                has_chart = False
 
-            # Protect charts and substantial in-content graphics. Ignore a
-            # decorative image that hangs below the actual content/footer.
             height_rows = max(0, bottom - top)
-            overlaps_content = top <= content_bottom
-            if has_chart or (overlaps_content and height_rows >= 4 and bottom <= content_bottom + 2):
+            width_cols = max(0, right - left)
+            if has_chart or (top > 10 and (height_rows >= 4 or width_cols >= 4)):
                 shapes.append({"top": top, "bottom": bottom})
         except Exception:
             pass
     return shapes
 
-def _get_page_break_rows(sheet) -> list[int]:
-    rows = []
+def _safe_break_row(break_after_row: int, merges: list[str], shapes: list[dict[str, int]]) -> int:
+    # RowBreak id is the last row of the previous page; Excel's break location
+    # is the first row of the next page.
+    target = int(break_after_row) + 1
+    changed = True
+    while changed:
+        changed = False
+        for ref in merges:
+            parsed = _expand_merge_ref(ref)
+            if parsed:
+                _, start_row, _, end_row = parsed
+                if start_row < target <= end_row:
+                    target = end_row + 1
+                    changed = True
+        for shape in shapes:
+            if shape["top"] < target <= shape["bottom"]:
+                target = shape["bottom"] + 1
+                changed = True
+    return target
+
+def _apply_safe_manual_breaks(sheet, meta: dict[str, Any]) -> None:
+    original = sorted(set(int(x) for x in meta.get("manual_breaks", []) if int(x) > 0))
+    if not original:
+        return
+
+    shapes = _get_content_shapes(sheet)
+    merges = list(meta.get("merges", []))
+    targets = sorted(set(_safe_break_row(x, merges, shapes) for x in original))
+
     try:
-        sheet.DisplayPageBreaks = True
-    except Exception:
-        pass
-    try:
-        for i in range(1, int(sheet.HPageBreaks.Count) + 1):
+        # Delete existing manual breaks only. Automatic breaks remain under
+        # Excel's FitToPages settings.
+        for i in range(int(sheet.HPageBreaks.Count), 0, -1):
             pb = sheet.HPageBreaks.Item(i)
             try:
-                rows.append(int(pb.Location.Row))
+                if int(pb.Type) == -4135:
+                    pb.Delete()
             except Exception:
                 pass
-    except Exception:
-        pass
-    return sorted(set(r for r in rows if r > 1))
 
-def _protect_page_breaks(sheet, merges: list[str], content_shapes: list[dict[str, int]]) -> None:
-    break_rows = _get_page_break_rows(sheet)
-    if not break_rows:
-        return
-
-    adjusted = []
-    for row in break_rows:
-        adjusted.append(_adjust_break_to_content(sheet, row, merges, content_shapes))
-    adjusted = sorted(set(adjusted))
-    if not adjusted:
-        return
-
-    try:
-        # Reset all manual/automatic breaks and re-add only safe manual breaks.
-        sheet.ResetAllPageBreaks()
-        for row in adjusted:
+        for row in targets:
             try:
                 sheet.HPageBreaks.Add(Before=sheet.Rows(row))
             except Exception:
@@ -282,30 +310,14 @@ def _protect_page_breaks(sheet, merges: list[str], content_shapes: list[dict[str
     except Exception:
         pass
 
-def _set_wrapping_for_long_text(sheet, merges: list[str]) -> None:
-    # The source files sometimes place long explanatory text inside a merged
-    # cell with wrapping disabled or constrained row height. Ensure the text
-    # itself is allowed to wrap; page-break protection then keeps the block on
-    # one page instead of clipping it at the break.
-    for ref in merges:
-        try:
-            rng = sheet.Range(ref)
-            value = rng.Cells(1, 1).Value
-            if isinstance(value, str) and len(value.strip()) >= 60:
-                rng.WrapText = True
-                try:
-                    rng.Rows.AutoFit()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
 def _content_bottom(sheet, meta: dict[str, Any]) -> int:
     _, _, last_row, _ = _sheet_bounds(sheet)
     for ref in meta.get("merges", []):
-        x = _expand_merge_ref(ref)
-        if x:
-            last_row = max(last_row, x[3])
+        parsed = _expand_merge_ref(ref)
+        if parsed:
+            last_row = max(last_row, parsed[3])
+    for shape in _get_content_shapes(sheet):
+        last_row = max(last_row, shape["bottom"])
     return last_row
 
 def _parse_print_area(area_text: str):
@@ -316,7 +328,7 @@ def _parse_print_area(area_text: str):
         return None
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
 
-def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]] = None):
+def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]] = None, pages_tall: Any = False):
     layout_meta = layout_meta or {}
     state = {
         "name": sheet.Name,
@@ -327,6 +339,7 @@ def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]]
         "fit_tall": None,
         "center_h": None,
     }
+
     try:
         state["active_sheet"] = workbook.ActiveSheet.Name
     except Exception:
@@ -340,37 +353,31 @@ def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]]
     except Exception:
         pass
 
+    _set_long_text_visibility(sheet, layout_meta.get("merges", []))
     content_bottom = _content_bottom(sheet, layout_meta)
-    shapes = _get_content_shapes(sheet, content_bottom)
-    _set_wrapping_for_long_text(sheet, layout_meta.get("merges", []))
 
     try:
         area = _parse_print_area(state["print_area"])
         if area:
             first_col, first_row, last_col, print_last_row = area
             final_row = max(print_last_row, content_bottom)
-            sheet.PageSetup.PrintArea = (
-                "$" + first_col + "$" + str(first_row) +
-                ":$" + last_col + "$" + str(final_row)
-            )
+            sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col + "$" + str(final_row)
         else:
             first_row, first_col, last_row, last_col_num = _sheet_bounds(sheet)
-            sheet.PageSetup.PrintArea = (
-                "$" + _xl_col(first_col) + "$" + str(first_row) +
-                ":$" + _xl_col(last_col_num) + "$" + str(max(last_row, content_bottom))
-            )
+            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col_num) + "$" + str(max(last_row, content_bottom))
 
-        # Fit width only. Never squeeze height: charts, tables and footnotes
-        # must flow to additional pages rather than be clipped.
         sheet.PageSetup.Zoom = False
         sheet.PageSetup.FitToPagesWide = 1
-        sheet.PageSetup.FitToPagesTall = False
+        sheet.PageSetup.FitToPagesTall = pages_tall if pages_tall else False
+
         if not area:
             sheet.PageSetup.CenterHorizontally = True
     except Exception:
         pass
 
-    _protect_page_breaks(sheet, layout_meta.get("merges", []), shapes)
+    # Move source manual breaks out of merged blocks and objects before Excel
+    # paginates the sheet.
+    _apply_safe_manual_breaks(sheet, layout_meta)
 
     try:
         sheet.Activate()
@@ -748,6 +755,13 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         layout_meta_by_sheet = {
             name: read_layout_metadata(input_path, name) for name in publication_sheets
         }
+        if len(publication_sheets) > 1:
+            pages_tall_by_sheet = {
+                publication_sheets[0]: 1,
+                publication_sheets[1]: 2,
+            }
+        else:
+            pages_tall_by_sheet = {publication_sheets[0]: False}
         name, plan, month = output_name(workbook, input_path, config, primary_sheet)
         output_pdf = output_dir / name
 
@@ -755,7 +769,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
             raise FileExistsError(f"Arquivo já existe: {output_pdf.name}")
 
         working_pdf = Path(tempfile.gettempdir()) / f"raiox_work_{os.getpid()}_{time.time_ns()}.pdf"
-        had_native_print_area = export_pdf(excel, workbook, working_pdf, publication_sheets, layout_meta_by_sheet)
+        had_native_print_area = export_pdf(excel, workbook, working_pdf, publication_sheets, layout_meta_by_sheet, pages_tall_by_sheet)
         time.sleep(0.25)
 
         with fitz.open(working_pdf) as doc:
