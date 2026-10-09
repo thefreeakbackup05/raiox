@@ -750,9 +750,28 @@ def create_excel_instance():
         pass
     return excel
 
+def _normalize_config(config: Any) -> dict[str, Any]:
+    if isinstance(config, dict):
+        return config
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    try:
+        parsed = dict(config)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    # Fall back to a clean default configuration rather than aborting every file.
+    log(f"Configuração recebida em formato inesperado: {type(config).__name__}; usando defaults.")
+    return dict(DEFAULT_CONFIG)
+
 def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any]) -> ProcessResult:
-    if not isinstance(config, dict):
-        raise TypeError("Configuração interna inválida: esperava um objeto.")
+    config = _normalize_config(config)
     result = ProcessResult(file=input_path.name)
     temp_root = Path(tempfile.mkdtemp(prefix="raiox_"))
     temp_input = temp_root / input_path.name
