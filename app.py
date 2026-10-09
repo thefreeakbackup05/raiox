@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.4.2"
+VERSION = "0.5.1"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -493,7 +493,7 @@ def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]]
     except Exception:
         pass
 
-    _apply_safe_manual_breaks(sheet, layout_meta)
+    _protect_page_breaks(sheet, layout_meta.get("merges", []))
 
     try:
         sheet.Activate()
