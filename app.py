@@ -271,54 +271,64 @@ def _get_content_shapes(sheet) -> list[dict[str, int]]:
 
             height_rows = max(0, bottom - top)
             width_cols = max(0, right - left)
-            # Every chart is protected. Large in-content images/tables are
-            # protected as well; tiny header logos are ignored.
+            # Protect every chart and every substantial in-content object.
+            # Tiny header/logo decorations are ignored.
             if has_chart or (top > 10 and (height_rows >= 4 or width_cols >= 4)):
                 shapes.append({"top": top, "bottom": bottom})
         except Exception:
             pass
     return shapes
 
-def _safe_break_row(break_after_row: int, merges: list[str], shapes: list[dict[str, int]]) -> int:
-    target = int(break_after_row) + 1
-    changed = True
-    while changed:
-        changed = False
+def _safe_break_row_for_row(row: int, merges: list[str], shapes: list[dict[str, int]]) -> Optional[int]:
+    # row is the first row of the next page. If it falls inside a merged block
+    # or object, move the page start to the beginning of that block/object.
+    target = int(row)
+    for ref in merges:
+        parsed = _expand_merge_ref(ref)
+        if parsed:
+            _, start_row, _, end_row = parsed
+            if start_row < target <= end_row:
+                return start_row
+    for shape in shapes:
+        if shape["top"] < target <= shape["bottom"]:
+            return shape["top"]
+    return None
 
-        for ref in merges:
-            parsed = _expand_merge_ref(ref)
-            if parsed:
-                _, start_row, _, end_row = parsed
-                if start_row < target <= end_row:
-                    target = end_row + 1
-                    changed = True
-
-        for shape in shapes:
-            if shape["top"] < target <= shape["bottom"]:
-                target = shape["bottom"] + 1
-                changed = True
-    return target
-
-def _apply_safe_manual_breaks(sheet, meta: dict[str, Any]) -> None:
-    original = sorted(set(int(x) for x in meta.get("manual_breaks", []) if int(x) > 0))
-    if not original:
-        return
-
-    shapes = _get_content_shapes(sheet)
-    merges = list(meta.get("merges", []))
-    targets = sorted(set(_safe_break_row(x, merges, shapes) for x in original))
-
+def _actual_break_rows(sheet) -> list[int]:
+    rows = []
     try:
-        # Remove and recreate only the source's manual breaks at safe rows.
-        for i in range(int(sheet.HPageBreaks.Count), 0, -1):
+        sheet.DisplayPageBreaks = True
+    except Exception:
+        pass
+    try:
+        for i in range(1, int(sheet.HPageBreaks.Count) + 1):
             pb = sheet.HPageBreaks.Item(i)
             try:
-                if int(pb.Type) == -4135:
-                    pb.Delete()
+                row = int(pb.Location.Row)
+                if row > 1:
+                    rows.append(row)
             except Exception:
                 pass
+    except Exception:
+        pass
+    return sorted(set(rows))
 
-        for row in targets:
+def _protect_page_breaks(sheet, merges: list[str]) -> None:
+    shapes = _get_content_shapes(sheet)
+    safe_to_add = set()
+
+    # Re-check after Excel recalculates page boundaries. At most a few passes
+    # are needed because every unsafe break is moved to a block's top row.
+    for _ in range(3):
+        changed = False
+        for row in _actual_break_rows(sheet):
+            safe = _safe_break_row_for_row(row, merges, shapes)
+            if safe is not None and safe not in safe_to_add:
+                safe_to_add.add(safe)
+                changed = True
+        if not changed:
+            break
+        for row in sorted(safe_to_add):
             try:
                 sheet.HPageBreaks.Add(Before=sheet.Rows(row))
             except Exception:
@@ -326,8 +336,7 @@ def _apply_safe_manual_breaks(sheet, meta: dict[str, Any]) -> None:
                     sheet.HPageBreaks.Add(sheet.Rows(row))
                 except Exception:
                     pass
-    except Exception:
-        pass
+        time.sleep(0.1)
 
 def _content_bottom(sheet, meta: dict[str, Any]) -> int:
     _, _, last_row, _ = _sheet_bounds(sheet)
@@ -338,6 +347,95 @@ def _content_bottom(sheet, meta: dict[str, Any]) -> int:
     for shape in _get_content_shapes(sheet):
         last_row = max(last_row, shape["bottom"])
     return last_row
+
+def _parse_print_area(area_text: str):
+    if not area_text:
+        return None
+    m = re.search(r"\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", str(area_text))
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
+
+def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]] = None):
+    layout_meta = layout_meta or {}
+    state = {
+        "name": sheet.Name,
+        "active_sheet": None,
+        "print_area": None,
+        "zoom": None,
+        "fit_wide": None,
+        "fit_tall": None,
+        "center_h": None,
+    }
+
+    try:
+        state["active_sheet"] = workbook.ActiveSheet.Name
+    except Exception:
+        pass
+
+    try:
+        state["print_area"] = sheet.PageSetup.PrintArea
+        state["zoom"] = sheet.PageSetup.Zoom
+        state["fit_wide"] = sheet.PageSetup.FitToPagesWide
+        state["fit_tall"] = sheet.PageSetup.FitToPagesTall
+        state["center_h"] = sheet.PageSetup.CenterHorizontally
+    except Exception:
+        pass
+
+    _set_long_text_visibility(sheet, layout_meta.get("merges", []))
+    content_bottom = _content_bottom(sheet, layout_meta)
+
+    try:
+        area = _parse_print_area(state["print_area"])
+        if area:
+            first_col, first_row, last_col, print_last_row = area
+            final_row = max(print_last_row, content_bottom)
+            sheet.PageSetup.PrintArea = "$" + first_col + "$" + str(first_row) + ":$" + last_col + "$" + str(final_row)
+        else:
+            first_row, first_col, last_row, last_col_num = _sheet_bounds(sheet)
+            final_row = max(last_row, content_bottom)
+            sheet.PageSetup.PrintArea = "$" + _xl_col(first_col) + "$" + str(first_row) + ":$" + _xl_col(last_col_num) + "$" + str(final_row)
+
+        # Width is forced to one page; HEIGHT IS ALWAYS AUTOMATIC.
+        # We never squeeze a long sheet into a fixed number of pages because
+        # doing so is what cuts charts, tables and footnotes.
+        sheet.PageSetup.Zoom = False
+        sheet.PageSetup.FitToPagesWide = 1
+        sheet.PageSetup.FitToPagesTall = False
+
+        # For sheets with no native PrintArea (Ford-style), center the result.
+        if not area:
+            sheet.PageSetup.CenterHorizontally = True
+    except Exception:
+        pass
+
+    # Excel now knows its automatic page boundaries. Move any boundary that
+    # falls through merged text/chart/table content to a safe position.
+    _protect_page_breaks(sheet, layout_meta.get("merges", []))
+
+    try:
+        sheet.Activate()
+    except Exception:
+        pass
+    return state
+
+def restore_sheet_excel_state(workbook, state):
+    try:
+        sheet = workbook.Worksheets(state["name"])
+        if state.get("print_area") is not None:
+            sheet.PageSetup.PrintArea = state.get("print_area")
+        if state.get("zoom") is not None:
+            sheet.PageSetup.Zoom = state.get("zoom")
+        if state.get("fit_wide") is not None:
+            sheet.PageSetup.FitToPagesWide = state.get("fit_wide")
+        if state.get("fit_tall") is not None:
+            sheet.PageSetup.FitToPagesTall = state.get("fit_tall")
+        if state.get("center_h") is not None:
+            sheet.PageSetup.CenterHorizontally = state.get("center_h")
+        if state.get("active_sheet"):
+            workbook.Worksheets(state["active_sheet"]).Activate()
+    except Exception:
+        pass
 
 def _parse_print_area(area_text: str):
     if not area_text:
@@ -479,58 +577,57 @@ def export_pdf(
     output: Path,
     publication_sheets: list[str],
     layout_meta_by_sheet: Optional[dict[str, dict[str, Any]]] = None,
-    pages_tall_by_sheet: Optional[dict[str, Any]] = None,
 ):
+    import tempfile
     layout_meta_by_sheet = layout_meta_by_sheet or {}
-    pages_tall_by_sheet = pages_tall_by_sheet or {}
     states = []
+    temp_files = []
     try:
         for name in publication_sheets:
             ws = workbook.Worksheets(name)
-            states.append(
-                prepare_sheet_for_pdf(
-                    workbook,
-                    ws,
-                    layout_meta_by_sheet.get(name, {}),
-                    pages_tall=pages_tall_by_sheet.get(name, False),
-                )
+            state = prepare_sheet_for_pdf(
+                workbook,
+                ws,
+                layout_meta_by_sheet.get(name, {}),
             )
+            states.append(state)
 
-        if len(publication_sheets) == 1:
-            sheet = workbook.Worksheets(publication_sheets[0])
-            sheet.Activate()
-            for attempt in range(1, 4):
-                try:
-                    if Path(output).exists():
-                        Path(output).unlink()
-                    sheet.ExportAsFixedFormat(0, str(output))
-                    if Path(output).exists() and Path(output).stat().st_size > 0:
-                        return bool(states and states[0].get("print_area"))
-                except Exception:
-                    if attempt < 3:
-                        time.sleep(1.0)
-            raise RuntimeError("O Excel não conseguiu exportar a lâmina de publicação para PDF.")
+            temp_pdf = Path(tempfile.gettempdir()) / (
+                f"raiox_sheet_{os.getpid()}_{time.time_ns()}_{len(temp_files)}.pdf"
+            )
+            temp_files.append(temp_pdf)
+            if temp_pdf.exists():
+                temp_pdf.unlink()
 
-        first = workbook.Worksheets(publication_sheets[0])
-        first.Activate()
-        first.Select()
-        for name in publication_sheets[1:]:
-            workbook.Worksheets(name).Select(False)
+            ws.Activate()
+            ws.ExportAsFixedFormat(0, str(temp_pdf))
+            if not temp_pdf.exists() or temp_pdf.stat().st_size == 0:
+                raise RuntimeError(f"O Excel não conseguiu exportar a aba '{name}'.")
 
-        for attempt in range(1, 4):
-            try:
-                if Path(output).exists():
-                    Path(output).unlink()
-                workbook.ActiveSheet.ExportAsFixedFormat(0, str(output))
-                if Path(output).exists() and Path(output).stat().st_size > 0:
-                    return all(bool(s.get("print_area")) for s in states)
-            except Exception:
-                if attempt < 3:
-                    time.sleep(1.0)
-        raise RuntimeError("O Excel não conseguiu exportar as lâminas de publicação para PDF.")
+        # Merge the independently exported sheets. This avoids COM sheet
+        # selection entirely and preserves each sheet's own page setup.
+        if Path(output).exists():
+            Path(output).unlink()
+
+        merged = fitz.open()
+        try:
+            for temp_pdf in temp_files:
+                with fitz.open(temp_pdf) as part:
+                    merged.insert_pdf(part)
+            merged.save(str(output), garbage=4, deflate=True)
+        finally:
+            merged.close()
+
+        return True
     finally:
         for state in reversed(states):
             restore_sheet_excel_state(workbook, state)
+        for temp_pdf in temp_files:
+            try:
+                if temp_pdf.exists():
+                    temp_pdf.unlink()
+            except Exception:
+                pass
 
 
 def page_ink_ratio(page: fitz.Page) -> float:
@@ -785,13 +882,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
         layout_meta_by_sheet = {
             name: read_layout_metadata(input_path, name) for name in publication_sheets
         }
-        if len(publication_sheets) > 1:
-            pages_tall_by_sheet = {
-                publication_sheets[0]: 1,
-                publication_sheets[1]: 2,
-            }
-        else:
-            pages_tall_by_sheet = {publication_sheets[0]: False}
+        # Height is automatic for every sheet; page breaks are protected dynamically.
         name, plan, month = output_name(workbook, input_path, config, primary_sheet)
         output_pdf = output_dir / name
 
@@ -799,16 +890,13 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
             raise FileExistsError(f"Arquivo já existe: {output_pdf.name}")
 
         working_pdf = Path(tempfile.gettempdir()) / f"raiox_work_{os.getpid()}_{time.time_ns()}.pdf"
-        had_native_print_area = export_pdf(excel, workbook, working_pdf, publication_sheets, layout_meta_by_sheet, pages_tall_by_sheet)
+        had_native_print_area = export_pdf(excel, workbook, working_pdf, publication_sheets, layout_meta_by_sheet)
         time.sleep(0.25)
 
         with fitz.open(working_pdf) as doc:
             result.pages_before = len(doc)
 
-        configured_expected = int(config.get("expected_pages", 3))
-        # Two-sheet standard model: expect the configured 3 pages. A one-sheet
-        # atypical model (such as current Ford) may legitimately have more.
-        expected = configured_expected if len(publication_sheets) > 1 else 0
+        expected = 0
         if config.get("trim_trailing_junk", True):
             result.pages_before, result.pages_after = trim_extra_pages(working_pdf, expected)
         else:
