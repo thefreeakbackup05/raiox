@@ -22,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "Gerador de Raio-X"
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 
 DEFAULT_CONFIG = {
     "input_dir": "XLSM",
@@ -208,10 +208,14 @@ def _set_long_text_visibility(sheet, merges: list[str]) -> None:
                     max(1, int(math.ceil(len(part) / chars_per_line))) if part else 1
                     for part in str(value).replace("\\r", "").split("\\n")
                 )
-                required = lines * max(13.5, font_size * 1.30) + 6.0
+                required = lines * max(13.5, font_size * 1.30) + 8.0
                 current = float(rng.Height)
-                if required > current * 1.10:
+                if required > current * 1.05:
                     rng.Rows.RowHeight = required / max(1, int(rng.Rows.Count))
+                    try:
+                        rng.EntireRow.AutoFit()
+                    except Exception:
+                        pass
             except Exception:
                 pass
         except Exception:
@@ -328,47 +332,68 @@ def _repair_manual_page_breaks(sheet, meta: dict[str, Any]) -> None:
         pass
 
 
-def _repair_automatic_page_breaks(sheet, merges: list[str]) -> None:
+def _actual_break_rows(sheet) -> list[int]:
+    rows = []
     try:
-        _, _, cell_bottom, _ = _sheet_bounds(sheet)
-        shapes = _get_content_shapes(sheet, cell_bottom)
+        sheet.DisplayPageBreaks = True
     except Exception:
-        shapes = []
-
-    for _ in range(3):
-        changed = False
-        for row in _actual_break_rows(sheet):
-            target = None
-
-            for ref in merges:
-                parsed = _expand_merge_ref(ref)
-                if parsed:
-                    _, start_row, _, end_row = parsed
-                    if start_row < row <= end_row:
-                        target = start_row
-                        break
-
-            if target is None:
-                for shape in shapes:
-                    if shape["top"] < row <= shape["bottom"]:
-                        target = shape["top"]
-                        break
-
-            if target is None or target <= 1:
-                continue
-
+        pass
+    try:
+        for i in range(1, int(sheet.HPageBreaks.Count) + 1):
             try:
-                before = len(_actual_break_rows(sheet))
-                sheet.HPageBreaks.Add(Before=sheet.Rows(target))
-                after = len(_actual_break_rows(sheet))
-                changed = after > before
+                row = int(sheet.HPageBreaks.Item(i).Location.Row)
+                if row > 1:
+                    rows.append(row)
             except Exception:
                 pass
+    except Exception:
+        pass
+    return sorted(set(rows))
 
-        if not changed:
-            break
-        time.sleep(0.1)
+def _repair_automatic_page_breaks(sheet, merges: list[str]) -> None:
+    for _ in range(4):
+        breaks = _actual_break_rows(sheet)
+        if not breaks:
+            return
 
+        try:
+            _, _, last_row, _ = _sheet_bounds(sheet)
+            shapes = _get_content_shapes(sheet, last_row)
+        except Exception:
+            shapes = []
+
+        protected = []
+        for ref in merges:
+            parsed = _expand_merge_ref(ref)
+            if parsed:
+                protected.append((parsed[1], parsed[3]))
+
+        for shape in shapes:
+            protected.append((shape["top"], shape["bottom"]))
+
+        added = False
+        for break_row in breaks:
+            for top, bottom in protected:
+                if top < break_row <= bottom and top > 1:
+                    try:
+                        sheet.HPageBreaks.Add(Before=sheet.Rows(top))
+                        added = True
+                    except Exception:
+                        try:
+                            sheet.HPageBreaks.Add(sheet.Rows(top))
+                            added = True
+                        except Exception:
+                            pass
+                    break
+
+        if not added:
+            return
+
+        try:
+            sheet.DisplayPageBreaks = True
+        except Exception:
+            pass
+        time.sleep(0.12)
 
 def prepare_sheet_for_pdf(workbook, sheet, layout_meta: Optional[dict[str, Any]] = None, repair_layout: bool = True):
     meta = layout_meta if isinstance(layout_meta, dict) else {}
@@ -1098,4 +1123,39 @@ def _startup_exception_hook(exc_type, exc_value, exc_tb):
 sys.excepthook = _startup_exception_hook
 
 if __name__=="__main__":
-    App().mainloop()
+    App().mainloop()def pdf_has_content(pdf_path: Path) -> bool:
+    try:
+        with fitz.open(pdf_path) as doc:
+            if len(doc) == 0:
+                return False
+            for page in doc:
+                if (page.get_text("text") or "").strip():
+                    return True
+                if len(page.get_images(full=True)) > 0:
+                    return True
+                try:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(0.20, 0.20),
+                        alpha=False,
+                    )
+                    if pix.samples:
+                        pixels = len(pix.samples) // pix.n
+                        step = max(1, pixels // 10000)
+                        ink = 0
+                        for n in range(0, pixels, step):
+                            pos = n * pix.n
+                            if (
+                                pix.samples[pos] < 245
+                                or pix.samples[pos + 1] < 245
+                                or pix.samples[pos + 2] < 245
+                            ):
+                                ink += 1
+                        if ink >= 10:
+                            return True
+                except Exception:
+                    pass
+    except Exception:
+        return False
+    return False
+
+
