@@ -11,9 +11,9 @@
   "click_text": "aqui",
   "plan_sheet": "LAMINA 2",
   "plan_cell": "A8",
-  "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de agosto",
+  "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de [MÊS DO RAIO X]",
   "strip_plan_prefix": "",
-  "expected_pages": 3,
+  "expected_pages": 0,
   "trim_trailing_junk": true,
   "overwrite": true
 }
