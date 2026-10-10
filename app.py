@@ -39,9 +39,9 @@ DEFAULT_CONFIG = {
     "plan_cell": "A8",
     "month_sheet": "LAMINA 2",
     "month_cell": "A4",
-    "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de agosto",
+    "output_pattern": "[NOME DO PLANO NO EXCEL] - Raio X de [MÊS DO RAIO X]",
     "strip_plan_prefix": "",
-    "expected_pages": 3,
+    "expected_pages": 0,
     "trim_trailing_junk": True,
     "overwrite": True,
 }
@@ -734,10 +734,24 @@ def output_name(workbook, input_path: Path, config: dict[str, Any], primary_shee
 
     pattern = str(config.get("output_pattern", DEFAULT_CONFIG["output_pattern"]))
     if "[MÊS DO RAIO X]" in pattern:
-        raise ValueError(
-            "A regra de nome ainda contém [MÊS DO RAIO X]. "
-            "Escreva o mês diretamente na regra."
-        )
+        period = None
+        for candidate in (primary_sheet_name, config.get("month_sheet", "LAMINA 2"), "LAMINA 2", "LAMINA"):
+            if not candidate:
+                continue
+            try:
+                period = excel_date_to_datetime(
+                    safe_cell_value(workbook.Worksheets(str(candidate)), config.get("month_cell", "A4"))
+                )
+                if period:
+                    break
+            except Exception:
+                pass
+        if period is None:
+            period = _sheet_period(ws_plan)
+        if period is None:
+            period = datetime.now()
+        month_label = f"{MONTHS_PT[period.month]} de {period.year}"
+        pattern = pattern.replace("[MÊS DO RAIO X]", month_label)
 
     return clean_filename(pattern.replace("[NOME DO PLANO NO EXCEL]", plan)) + ".pdf"
 
@@ -1072,7 +1086,7 @@ class App(tk.Tk):
         self.click_var.set(self.config_data.get("click_text","aqui"))
         self.pattern_var.set(self.config_data.get("output_pattern",DEFAULT_CONFIG["output_pattern"]))
         self.strip_prefix_var.set(self.config_data.get("strip_plan_prefix",""))
-        self.expected_pages_var.set(str(self.config_data.get("expected_pages",3)))
+        self.expected_pages_var.set(str(self.config_data.get("expected_pages",0)))
 
     def choose_dir(self,var):
         p=filedialog.askdirectory()
