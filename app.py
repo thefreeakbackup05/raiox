@@ -273,7 +273,7 @@ def _content_bottom(sheet, meta: dict[str, Any]) -> int:
 def _parse_print_area(area_text: str):
     if not area_text:
         return None
-    m = re.search(r"\\$?([A-Z]+)\\$?(\\d+):\\$?([A-Z]+)\\$?(\\d+)", str(area_text))
+    m = re.search(r"\$?([A-Z]+)\$?(\d+):\$?([A-Z]+)\$?(\d+)", str(area_text))
     if not m:
         return None
     return m.group(1), int(m.group(2)), m.group(3), int(m.group(4))
@@ -756,7 +756,7 @@ def _sheet_period(sheet) -> Optional[datetime]:
         "julho":7, "agosto":8, "setembro":9, "outubro":10, "novembro":11, "dezembro":12
     }
     for name, num in months.items():
-        m = re.search(rf"\\b{name}\\b\\s*(?:de\\s*)?(\\d{{4}})", s)
+        m = re.search(rf"\b{name}\b\s*(?:de\s*)?(\d{{4}})", s)
         if m:
             return datetime(int(m.group(1)), num, 1)
     return None
@@ -864,7 +864,7 @@ def process_one(excel, input_path: Path, output_dir: Path, config: dict[str, Any
             for name in publication_sheets
         }
 
-        name = output_name(workbook, config, primary_sheet)
+        name = output_name(workbook, input_path, config, primary_sheet)
         output_pdf = output_dir / name
 
         temp_parts: list[Path] = []
